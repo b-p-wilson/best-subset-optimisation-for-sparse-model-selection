@@ -1,0 +1,4844 @@
+---
+title: 'Experiment 2: Effect of Noise/SNR'
+author: "Benjamin Wilson"
+date: "2026-10-13"
+output: html_document
+---
+
+```{r}
+## ============================================================
+## SECTION 1
+## Install and load required R packages
+## ============================================================
+
+options(
+  repos = c(
+    CRAN = "https://cloud.r-project.org"
+  )
+)
+
+
+if (!requireNamespace(
+  "remotes",
+  quietly = TRUE
+)) {
+
+  install.packages(
+    "remotes"
+  )
+}
+
+
+if (!requireNamespace(
+  "L0Learn",
+  quietly = TRUE
+)) {
+
+  remotes::install_github(
+    "hazimehh/L0Learn",
+    dependencies = TRUE,
+    upgrade = "never"
+  )
+}
+
+
+if (!requireNamespace(
+  "combss",
+  quietly = TRUE
+)) {
+
+  remotes::install_github(
+    "benoit-liquet/combss",
+    dependencies = TRUE,
+    upgrade = "never"
+  )
+}
+
+
+cran_packages <- c(
+  "abess",
+  "dplyr",
+  "ggplot2"
+)
+
+
+for (pkg in cran_packages) {
+
+  if (!requireNamespace(
+    pkg,
+    quietly = TRUE
+  )) {
+
+    install.packages(
+      pkg
+    )
+  }
+}
+
+
+required_packages <- c(
+  "L0Learn",
+  "combss",
+  "abess",
+  "dplyr",
+  "ggplot2"
+)
+
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+
+if (length(missing_packages) > 0) {
+
+  stop(
+    paste(
+      "The following packages could not be loaded:",
+      paste(
+        missing_packages,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+suppressPackageStartupMessages({
+
+  library(L0Learn)
+
+  library(combss)
+
+  library(abess)
+
+  library(dplyr)
+
+  library(ggplot2)
+})
+
+
+Sys.setenv(
+  OMP_THREAD_LIMIT = "1",
+  OMP_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1"
+)
+
+
+cat(
+  "All R packages loaded successfully.\n\n"
+)
+
+
+cat(
+  "L0Learn:",
+  as.character(
+    packageVersion("L0Learn")
+  ),
+  "\n"
+)
+
+
+cat(
+  "COMBSS:",
+  as.character(
+    packageVersion("combss")
+  ),
+  "\n"
+)
+
+
+cat(
+  "ABESS:",
+  as.character(
+    packageVersion("abess")
+  ),
+  "\n"
+)
+```
+
+```{r}
+## ============================================================
+## SECTION 2
+## Set up Python and IBM CPLEX
+## ============================================================
+
+python_bin <- Sys.which(
+  "python3"
+)
+
+
+if (python_bin == "") {
+
+  stop(
+    "python3 was not found. Install Python 3 before continuing."
+  )
+}
+
+
+cat(
+  "Using Python:",
+  python_bin,
+  "\n"
+)
+
+
+run_python_command <- function(args) {
+
+  out <- system2(
+    python_bin,
+    args = args,
+    stdout = TRUE,
+    stderr = TRUE
+  )
+
+
+  status <- attr(
+    out,
+    "status"
+  )
+
+
+  if (is.null(status)) {
+
+    status <- 0L
+  }
+
+
+  list(
+    output = out,
+    status = status
+  )
+}
+
+
+check_cplex <- run_python_command(
+
+  c(
+    "-c",
+    shQuote(
+      "import cplex; print(cplex.__version__)"
+    )
+  )
+)
+
+
+if (check_cplex$status != 0) {
+
+  cat(
+    "Python CPLEX package not found. Attempting installation...\n"
+  )
+
+
+  system2(
+
+    python_bin,
+
+    args = c(
+      "-m",
+      "pip",
+      "install",
+      "cplex",
+      "docplex"
+    )
+  )
+
+
+  check_cplex <- run_python_command(
+
+    c(
+      "-c",
+      shQuote(
+        "import cplex; print(cplex.__version__)"
+      )
+    )
+  )
+}
+
+
+if (check_cplex$status != 0) {
+
+  stop(
+    "CPLEX could not be imported into Python."
+  )
+}
+
+
+cat(
+  "CPLEX version:",
+  paste(
+    check_cplex$output,
+    collapse = " "
+  ),
+  "\n"
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 3
+## Create Python CPLEX solver
+## ============================================================
+
+CPLEX_SOLVER_SCRIPT <- file.path(
+  tempdir(),
+  "solve_cplex.py"
+)
+
+
+python_solver <- c(
+
+  "import sys",
+
+  "import cplex",
+
+  "",
+
+  "lpfile = sys.argv[1]",
+
+  "solfile = sys.argv[2]",
+
+  "",
+
+  "problem = cplex.Cplex(lpfile)",
+
+  "",
+
+  "problem.set_log_stream(None)",
+
+  "problem.set_warning_stream(None)",
+
+  "problem.set_results_stream(None)",
+
+  "",
+
+  "problem.parameters.threads.set(1)",
+
+  "",
+
+  "problem.parameters.mip.tolerances.mipgap.set(1e-6)",
+
+  "",
+
+  "problem.solve()",
+
+  "",
+
+  "status = problem.solution.get_status_string()",
+
+  "print('CPLEX status:', status)",
+
+  "",
+
+  "if not problem.solution.is_primal_feasible():",
+
+  "    print('No primal feasible solution found.')",
+
+  "    sys.exit(2)",
+
+  "",
+
+  "objective = problem.solution.get_objective_value()",
+
+  "print('Objective:', objective)",
+
+  "",
+
+  "try:",
+
+  "    gap = problem.solution.MIP.get_mip_relative_gap()",
+
+  "    print('MIP gap:', gap)",
+
+  "except:",
+
+  "    pass",
+
+  "",
+
+  "problem.solution.write(solfile)"
+)
+
+
+writeLines(
+  python_solver,
+  CPLEX_SOLVER_SCRIPT
+)
+
+
+cat(
+  "Created CPLEX solver at:\n",
+  CPLEX_SOLVER_SCRIPT,
+  "\n"
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 4
+## Exact fixed-size best subset selection using CPLEX
+## ============================================================
+
+best_subset_cplex <- function(
+    X,
+    y,
+    s,
+    M = 20
+) {
+
+  n <- nrow(X)
+
+  p <- ncol(X)
+
+
+  work <- tempfile(
+    "cplex_"
+  )
+
+
+  dir.create(
+    work
+  )
+
+
+  on.exit(
+    unlink(
+      work,
+      recursive = TRUE
+    ),
+    add = TRUE
+  )
+
+
+  lpfile <- file.path(
+    work,
+    "model.lp"
+  )
+
+
+  solfile <- file.path(
+    work,
+    "solution.sol"
+  )
+
+
+  con <- file(
+    lpfile,
+    "wt"
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Objective
+  ## ----------------------------------------------------------
+
+  writeLines(
+    "Minimize",
+    con
+  )
+
+
+  writeLines(
+    " obj: [",
+    con
+  )
+
+
+  for (i in seq_len(n)) {
+
+    writeLines(
+
+      sprintf(
+        " + 2 r_%d ^ 2",
+        i
+      ),
+
+      con
+    )
+  }
+
+
+  writeLines(
+    " ] / 2",
+    con
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Residual constraints
+  ## ----------------------------------------------------------
+
+  writeLines(
+    "Subject To",
+    con
+  )
+
+
+  chunk <- 10
+
+
+  for (i in seq_len(n)) {
+
+    starts <- seq(
+      1,
+      p,
+      by = chunk
+    )
+
+
+    for (cc in seq_along(starts)) {
+
+      start <- starts[cc]
+
+      finish <- min(
+        start + chunk - 1,
+        p
+      )
+
+
+      txt <- ""
+
+
+      if (cc == 1) {
+
+        txt <- sprintf(
+          " resid_%d:",
+          i
+        )
+      }
+
+
+      for (j in start:finish) {
+
+        a <- X[
+          i,
+          j
+        ]
+
+
+        if (abs(a) < 1e-14) {
+
+          next
+        }
+
+
+        if (a >= 0) {
+
+          txt <- paste0(
+            txt,
+            sprintf(
+              " + %.12g beta_%d",
+              a,
+              j
+            )
+          )
+
+        } else {
+
+          txt <- paste0(
+            txt,
+            sprintf(
+              " - %.12g beta_%d",
+              -a,
+              j
+            )
+          )
+        }
+      }
+
+
+      if (finish == p) {
+
+        txt <- paste0(
+          txt,
+          sprintf(
+            " + r_%d = %.12g",
+            i,
+            y[i]
+          )
+        )
+      }
+
+
+      writeLines(
+        txt,
+        con
+      )
+    }
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Big-M constraints
+  ## ----------------------------------------------------------
+
+  for (j in seq_len(p)) {
+
+    writeLines(
+
+      sprintf(
+        " U%d: beta_%d - %.12g z_%d <= 0",
+        j,
+        j,
+        M,
+        j
+      ),
+
+      con
+    )
+
+
+    writeLines(
+
+      sprintf(
+        " L%d: - beta_%d - %.12g z_%d <= 0",
+        j,
+        j,
+        M,
+        j
+      ),
+
+      con
+    )
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Exactly s predictors
+  ## ----------------------------------------------------------
+
+  writeLines(
+    " card:",
+    con
+  )
+
+
+  chunk_z <- 25
+
+
+  for (
+    start in seq(
+      1,
+      p,
+      by = chunk_z
+    )
+  ) {
+
+    finish <- min(
+      start + chunk_z - 1,
+      p
+    )
+
+
+    txt <- ""
+
+
+    for (j in start:finish) {
+
+      txt <- paste0(
+        txt,
+        sprintf(
+          " + z_%d",
+          j
+        )
+      )
+    }
+
+
+    if (finish == p) {
+
+      txt <- paste0(
+        txt,
+        sprintf(
+          " = %d",
+          s
+        )
+      )
+    }
+
+
+    writeLines(
+      txt,
+      con
+    )
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Bounds
+  ## ----------------------------------------------------------
+
+  writeLines(
+    "Bounds",
+    con
+  )
+
+
+  for (j in seq_len(p)) {
+
+    writeLines(
+
+      sprintf(
+        " -%.12g <= beta_%d <= %.12g",
+        M,
+        j,
+        M
+      ),
+
+      con
+    )
+  }
+
+
+  for (i in seq_len(n)) {
+
+    writeLines(
+
+      sprintf(
+        " r_%d free",
+        i
+      ),
+
+      con
+    )
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Binary variables
+  ## ----------------------------------------------------------
+
+  writeLines(
+    "Binary",
+    con
+  )
+
+
+  for (
+    start in seq(
+      1,
+      p,
+      by = 25
+    )
+  ) {
+
+    finish <- min(
+      start + 24,
+      p
+    )
+
+
+    txt <- ""
+
+
+    for (j in start:finish) {
+
+      txt <- paste0(
+        txt,
+        sprintf(
+          " z_%d",
+          j
+        )
+      )
+    }
+
+
+    writeLines(
+      txt,
+      con
+    )
+  }
+
+
+  writeLines(
+    "End",
+    con
+  )
+
+
+  close(
+    con
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Solve
+  ## ----------------------------------------------------------
+
+  solve_start <- proc.time()[3]
+
+
+  out <- system2(
+
+    python_bin,
+
+    args = c(
+
+      shQuote(
+        CPLEX_SOLVER_SCRIPT
+      ),
+
+      shQuote(
+        lpfile
+      ),
+
+      shQuote(
+        solfile
+      )
+    ),
+
+    stdout = TRUE,
+
+    stderr = TRUE
+  )
+
+
+  solve_seconds <-
+    proc.time()[3] -
+    solve_start
+
+
+  if (!file.exists(
+    solfile
+  )) {
+
+    cat(
+      paste(
+        out,
+        collapse = "\n"
+      ),
+      "\n"
+    )
+
+
+    stop(
+      "CPLEX did not produce a solution."
+    )
+  }
+
+
+  status_line <- grep(
+    "^CPLEX status:",
+    out,
+    value = TRUE
+  )
+
+
+  cplex_status <-
+
+    if (length(status_line) > 0) {
+
+      sub(
+        "^CPLEX status:[[:space:]]*",
+        "",
+        status_line[1]
+      )
+
+    } else {
+
+      NA_character_
+    }
+
+
+  gap_line <- grep(
+    "^MIP gap:",
+    out,
+    value = TRUE
+  )
+
+
+  mip_gap <-
+
+    if (length(gap_line) > 0) {
+
+      as.numeric(
+        sub(
+          "^MIP gap:[[:space:]]*",
+          "",
+          gap_line[1]
+        )
+      )
+
+    } else {
+
+      NA_real_
+    }
+
+
+  sol <- readLines(
+    solfile,
+    warn = FALSE
+  )
+
+
+  beta <- numeric(p)
+
+  z <- numeric(p)
+
+
+  for (line in sol) {
+
+    if (!grepl(
+      "<variable",
+      line,
+      fixed = TRUE
+    )) {
+
+      next
+    }
+
+
+    name_match <- regmatches(
+
+      line,
+
+      regexec(
+        'name="([^"]+)"',
+        line,
+        perl = TRUE
+      )
+    )[[1]]
+
+
+    if (length(name_match) != 2) {
+
+      next
+    }
+
+
+    name <- name_match[2]
+
+
+    value_match <- regmatches(
+
+      line,
+
+      regexec(
+        'value="([-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)"',
+        line,
+        perl = TRUE
+      )
+    )[[1]]
+
+
+    if (length(value_match) != 2) {
+
+      next
+    }
+
+
+    value <- as.numeric(
+      value_match[2]
+    )
+
+
+    if (grepl(
+      "^beta_[0-9]+$",
+      name
+    )) {
+
+      j <- as.integer(
+        sub(
+          "^beta_",
+          "",
+          name
+        )
+      )
+
+
+      if (!is.na(j) && j <= p) {
+
+        beta[j] <- value
+      }
+    }
+
+
+    if (grepl(
+      "^z_[0-9]+$",
+      name
+    )) {
+
+      j <- as.integer(
+        sub(
+          "^z_",
+          "",
+          name
+        )
+      )
+
+
+      if (!is.na(j) && j <= p) {
+
+        z[j] <- value
+      }
+    }
+  }
+
+
+  rss <- sum(
+    (
+      y -
+        X %*% beta
+    )^2
+  )
+
+
+  max_abs_beta <- max(
+    abs(beta)
+  )
+
+
+  if (
+    max_abs_beta >
+      0.95 * M
+  ) {
+
+    warning(
+      "A CPLEX coefficient is close to Big-M."
+    )
+  }
+
+
+  list(
+
+    selected =
+      which(
+        z > 0.5
+      ),
+
+    beta =
+      beta,
+
+    z =
+      z,
+
+    rss =
+      rss,
+
+    status =
+      cplex_status,
+
+    mip_gap =
+      mip_gap,
+
+    solve_seconds =
+      solve_seconds,
+
+    max_abs_beta =
+      max_abs_beta,
+
+    cplex_output =
+      out
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 5
+## Experiment 2 settings - Effect of SNR
+## ============================================================
+
+
+## ------------------------------------------------------------
+## Baseline dimensions
+## ------------------------------------------------------------
+
+n <- 200
+
+p <- 50
+
+
+## ------------------------------------------------------------
+## Fixed true model size
+## ------------------------------------------------------------
+
+s_true <- 4
+
+
+## ------------------------------------------------------------
+## Fixed predictor correlation
+## ------------------------------------------------------------
+
+rho <- 0.20
+
+
+## ------------------------------------------------------------
+## Signal-to-noise ratios
+## ------------------------------------------------------------
+
+snr_values <- c(
+  0.5,
+  1,
+  2,
+  5,
+  10
+)
+
+
+## ------------------------------------------------------------
+## Monte Carlo replications
+## ------------------------------------------------------------
+
+n_rep <- 100
+
+## For testing:
+# n_rep <- 5
+
+
+## ------------------------------------------------------------
+## True coefficient magnitudes
+## ------------------------------------------------------------
+
+beta_min <- 1
+
+beta_max <- 2
+
+
+## ------------------------------------------------------------
+## CPLEX
+## ------------------------------------------------------------
+
+big_M <- 20
+
+
+## ------------------------------------------------------------
+## L0Learn
+##
+## Continue well beyond the true size so that the regularisation
+## path can contain as many different cardinalities as possible.
+## ------------------------------------------------------------
+
+l0_max_support <- 20
+
+
+## Main dense lambda grid
+l0_grid_points <- 1200
+
+
+## Extend both ends of pilot lambda range
+l0_upper_multiplier <- 2
+
+l0_lower_multiplier <- 0.02
+
+
+## ------------------------------------------------------------
+## L0Learn adaptive refinement
+##
+## Every interval in which the support size jumps by more than
+## one is refined. This is intended to recover narrow lambda
+## intervals associated with otherwise skipped model sizes.
+## ------------------------------------------------------------
+
+l0_refine_points_per_gap <- 100
+
+l0_refine_rounds <- 2
+
+
+## ------------------------------------------------------------
+## Reproducibility
+## ------------------------------------------------------------
+
+master_seed <- 12345
+
+
+cat(
+  "Experiment 2 - Effect of SNR\n\n"
+)
+
+
+cat(
+  "n =",
+  n,
+  "\n"
+)
+
+
+cat(
+  "p =",
+  p,
+  "\n"
+)
+
+
+cat(
+  "True model size =",
+  s_true,
+  "\n"
+)
+
+
+cat(
+  "rho =",
+  rho,
+  "\n"
+)
+
+
+cat(
+  "SNR values =",
+  paste(
+    snr_values,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+cat(
+  "Replications =",
+  n_rep,
+  "\n"
+)
+
+
+cat(
+  "L0Learn initial lambda grid =",
+  l0_grid_points,
+  "\n"
+)
+
+
+cat(
+  "L0Learn refinement rounds =",
+  l0_refine_rounds,
+  "\n"
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 6
+## Generate one Monte Carlo replication
+## ============================================================
+
+generate_replication_base <- function(
+    rep_id,
+    n,
+    p,
+    rho,
+    s_true,
+    beta_min,
+    beta_max,
+    master_seed
+) {
+
+  set.seed(
+    master_seed +
+      rep_id
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Equicorrelated Gaussian predictors
+  ## ----------------------------------------------------------
+
+  common_factor <- rnorm(
+    n
+  )
+
+
+  Z <- matrix(
+
+    rnorm(
+      n * p
+    ),
+
+    nrow = n,
+
+    ncol = p
+  )
+
+
+  X_raw <- sqrt(
+    rho
+  ) *
+    matrix(
+      common_factor,
+      nrow = n,
+      ncol = p
+    ) +
+    sqrt(
+      1 - rho
+    ) *
+    Z
+
+
+  ## ----------------------------------------------------------
+  ## Centre and standardise predictors
+  ## ----------------------------------------------------------
+
+  X <- scale(
+    X_raw,
+    center = TRUE,
+    scale = TRUE
+  )
+
+
+  X <- as.matrix(
+    X
+  )
+
+
+  colnames(
+    X
+  ) <- paste0(
+    "X",
+    seq_len(p)
+  )
+
+
+  ## ----------------------------------------------------------
+  ## True support
+  ## ----------------------------------------------------------
+
+  true_support <- sort(
+    sample(
+      seq_len(p),
+      size = s_true,
+      replace = FALSE
+    )
+  )
+
+
+  ## ----------------------------------------------------------
+  ## True coefficients
+  ## ----------------------------------------------------------
+
+  magnitudes <- runif(
+    s_true,
+    min = beta_min,
+    max = beta_max
+  )
+
+
+  signs <- sample(
+    c(-1, 1),
+    size = s_true,
+    replace = TRUE
+  )
+
+
+  beta_true <- numeric(
+    p
+  )
+
+
+  beta_true[
+    true_support
+  ] <-
+    signs *
+    magnitudes
+
+
+  ## ----------------------------------------------------------
+  ## Signal
+  ## ----------------------------------------------------------
+
+  signal <- as.vector(
+    X %*%
+      beta_true
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Common noise direction
+  ##
+  ## This same vector is scaled differently for each SNR.
+  ## ----------------------------------------------------------
+
+  epsilon_base <- rnorm(
+    n
+  )
+
+
+  epsilon_base <- as.numeric(
+    scale(
+      epsilon_base,
+      center = TRUE,
+      scale = TRUE
+    )
+  )
+
+
+  list(
+
+    X =
+      X,
+
+    true_support =
+      true_support,
+
+    beta_true =
+      beta_true,
+
+    signal =
+      signal,
+
+    epsilon_base =
+      epsilon_base
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 7
+## Construct dataset at a particular SNR
+## ============================================================
+
+make_dataset_snr <- function(
+    base,
+    target_snr
+) {
+
+  X <- base$X
+
+  signal <- base$signal
+
+
+  ## ----------------------------------------------------------
+  ## Choose noise variance so that
+  ##
+  ## Var(signal) / Var(noise) = target_snr
+  ## ----------------------------------------------------------
+
+  signal_variance <- var(
+    signal
+  )
+
+
+  sigma <- sqrt(
+    signal_variance /
+      target_snr
+  )
+
+
+  epsilon <-
+    sigma *
+    base$epsilon_base
+
+
+  y <-
+    signal +
+    epsilon
+
+
+  ## Numerical centring
+  y <- y -
+    mean(y)
+
+
+  realised_snr <-
+    var(signal) /
+    var(epsilon)
+
+
+  list(
+
+    X =
+      X,
+
+    y =
+      y,
+
+    beta_true =
+      base$beta_true,
+
+    true_support =
+      base$true_support,
+
+    sigma =
+      sigma,
+
+    target_snr =
+      target_snr,
+
+    realised_snr =
+      realised_snr
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 8
+## Common helper functions
+## ============================================================
+
+
+ols_refit <- function(
+    X,
+    y,
+    support
+) {
+
+  support <- sort(
+    unique(
+      as.integer(
+        support
+      )
+    )
+  )
+
+
+  p <- ncol(
+    X
+  )
+
+
+  if (length(support) == 0) {
+
+    return(
+      list(
+
+        beta =
+          numeric(p),
+
+        fitted =
+          rep(
+            0,
+            length(y)
+          ),
+
+        rss =
+          sum(
+            y^2
+          )
+      )
+    )
+  }
+
+
+  Xs <- X[
+    ,
+    support,
+    drop = FALSE
+  ]
+
+
+  fit <- lm.fit(
+    x = Xs,
+    y = y
+  )
+
+
+  beta <- numeric(
+    p
+  )
+
+
+  beta[
+    support
+  ] <- fit$coefficients
+
+
+  list(
+
+    beta =
+      beta,
+
+    fitted =
+      as.vector(
+        fit$fitted.values
+      ),
+
+    rss =
+      sum(
+        fit$residuals^2
+      )
+  )
+}
+
+
+support_metrics <- function(
+    selected,
+    truth
+) {
+
+  selected <- sort(
+    unique(
+      as.integer(selected)
+    )
+  )
+
+
+  truth <- sort(
+    unique(
+      as.integer(truth)
+    )
+  )
+
+
+  TP <- length(
+    intersect(
+      selected,
+      truth
+    )
+  )
+
+
+  FP <- length(
+    setdiff(
+      selected,
+      truth
+    )
+  )
+
+
+  FN <- length(
+    setdiff(
+      truth,
+      selected
+    )
+  )
+
+
+  precision <-
+
+    if (length(selected) > 0) {
+
+      TP /
+        length(selected)
+
+    } else {
+
+      NA_real_
+    }
+
+
+  recall <-
+    TP /
+    length(truth)
+
+
+  union_size <- length(
+    union(
+      selected,
+      truth
+    )
+  )
+
+
+  jaccard <-
+
+    if (union_size > 0) {
+
+      TP /
+        union_size
+
+    } else {
+
+      1
+    }
+
+
+  exact <- setequal(
+    selected,
+    truth
+  )
+
+
+  list(
+
+    exact =
+      exact,
+
+    TP =
+      TP,
+
+    FP =
+      FP,
+
+    FN =
+      FN,
+
+    precision =
+      precision,
+
+    recall =
+      recall,
+
+    jaccard =
+      jaccard
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 9
+## CPLEX wrapper
+## ============================================================
+
+fit_cplex_method <- function(
+    X,
+    y,
+    s,
+    M
+) {
+
+  start_time <- proc.time()[3]
+
+
+  fit <- best_subset_cplex(
+
+    X = X,
+
+    y = y,
+
+    s = s,
+
+    M = M
+  )
+
+
+  runtime <-
+    proc.time()[3] -
+    start_time
+
+
+  support <- sort(
+    as.integer(
+      fit$selected
+    )
+  )
+
+
+  list(
+
+    support =
+      support,
+
+    runtime =
+      runtime,
+
+    exact_size_available =
+      length(support) ==
+      s,
+
+    status =
+      fit$status,
+
+    mip_gap =
+      fit$mip_gap,
+
+    max_abs_beta =
+      fit$max_abs_beta
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 10
+## COMBSS wrapper
+## ============================================================
+
+fit_combss_method <- function(
+    X,
+    y,
+    s
+) {
+
+  start_time <- proc.time()[3]
+
+
+  fit <- combss::combss(
+
+    x = X,
+
+    y = y,
+
+    family = "gaussian",
+
+    q = s,
+
+    lam_ridge = 0,
+
+    Niter = 25,
+
+    alpha = 0.01,
+
+    scale = FALSE,
+
+    verbose = FALSE
+  )
+
+
+  runtime <-
+    proc.time()[3] -
+    start_time
+
+
+  if (
+    length(
+      fit$subset_list
+    ) < s
+  ) {
+
+    stop(
+      paste(
+        "COMBSS did not return model size",
+        s
+      )
+    )
+  }
+
+
+  support <- sort(
+    as.integer(
+      fit$subset_list[[s]]
+    )
+  )
+
+
+  list(
+
+    support =
+      support,
+
+    runtime =
+      runtime,
+
+    exact_size_available =
+      length(support) ==
+      s
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 11
+## ABESS wrapper
+## ============================================================
+
+fit_abess_method <- function(
+    X,
+    y,
+    s
+) {
+
+  start_time <- proc.time()[3]
+
+
+  fit <- abess::abess(
+
+    x = X,
+
+    y = y,
+
+    family = "gaussian",
+
+    tune.path = "sequence",
+
+    support.size = s,
+
+    tune.type = "gic",
+
+    lambda = 0,
+
+    normalize = 0,
+
+    fit.intercept = FALSE,
+
+    early.stop = FALSE,
+
+    warm.start = TRUE,
+
+    num.threads = 1
+  )
+
+
+  model <- abess::extract(
+    fit,
+    support.size = s
+  )
+
+
+  runtime <-
+    proc.time()[3] -
+    start_time
+
+
+  beta_hat <- as.numeric(
+    model$beta
+  )
+
+
+  support <- sort(
+    which(
+      abs(
+        beta_hat
+      ) >
+        1e-10
+    )
+  )
+
+
+  list(
+
+    support =
+      support,
+
+    runtime =
+      runtime,
+
+    exact_size_available =
+      length(support) ==
+      s
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 12
+## Dense and adaptively refined L0Learn path
+## ============================================================
+
+fit_l0learn_dense <- function(
+    X,
+    y,
+    target_s,
+    max_support,
+    grid_points = 1200,
+    upper_multiplier = 2,
+    lower_multiplier = 0.02,
+    refine_points_per_gap = 100,
+    refine_rounds = 2
+) {
+
+  total_start <- proc.time()[3]
+
+
+  ## ==========================================================
+  ## STEP 1
+  ## Pilot path
+  ## ==========================================================
+
+  pilot_fit <- L0Learn::L0Learn.fit(
+
+    x = X,
+
+    y = y,
+
+    loss = "SquaredError",
+
+    penalty = "L0",
+
+    algorithm = "CD",
+
+    maxSuppSize =
+      max_support,
+
+    nLambda = 100,
+
+    scaleDownFactor = 0.80,
+
+    intercept = FALSE
+  )
+
+
+  pilot_lambda <- as.numeric(
+    pilot_fit$lambda[[1]]
+  )
+
+
+  pilot_lambda <- pilot_lambda[
+    is.finite(
+      pilot_lambda
+    ) &
+      pilot_lambda >
+      0
+  ]
+
+
+  if (length(pilot_lambda) < 2) {
+
+    stop(
+      "L0Learn pilot path did not produce a usable lambda range."
+    )
+  }
+
+
+  lambda_upper <-
+    max(
+      pilot_lambda
+    ) *
+    upper_multiplier
+
+
+  lambda_lower <-
+    min(
+      pilot_lambda
+    ) *
+    lower_multiplier
+
+
+  ## ==========================================================
+  ## STEP 2
+  ## Initial dense grid
+  ## ==========================================================
+
+  lambda_grid <- exp(
+
+    seq(
+
+      from =
+        log(
+          lambda_upper
+        ),
+
+      to =
+        log(
+          lambda_lower
+        ),
+
+      length.out =
+        grid_points
+    )
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Function for fitting one explicit lambda grid
+  ## ----------------------------------------------------------
+
+  run_cdpsi <- function(
+      lambda_values
+  ) {
+
+    L0Learn::L0Learn.fit(
+
+      x = X,
+
+      y = y,
+
+      loss = "SquaredError",
+
+      penalty = "L0",
+
+      algorithm = "CDPSI",
+
+      maxSuppSize =
+        max_support,
+
+      lambdaGrid =
+        list(
+          lambda_values
+        ),
+
+      partialSort = TRUE,
+
+      maxIters = 200,
+
+      rtol = 1e-6,
+
+      atol = 1e-9,
+
+      activeSet = TRUE,
+
+      activeSetNum = 3,
+
+      maxSwaps = 100,
+
+      screenSize = ncol(X),
+
+      intercept = FALSE
+    )
+  }
+
+
+  ## ==========================================================
+  ## STEP 3
+  ## Initial CDPSI path
+  ## ==========================================================
+
+  fit <- run_cdpsi(
+    lambda_grid
+  )
+
+
+  refinement_rounds_used <- 0
+
+
+  ## ==========================================================
+  ## STEP 4
+  ## Refine every lambda interval where cardinality jumps
+  ## ==========================================================
+
+  if (refine_rounds > 0) {
+
+    for (
+      rr in seq_len(
+        refine_rounds
+      )
+    ) {
+
+      fitted_lambda <- as.numeric(
+        fit$lambda[[1]]
+      )
+
+
+      support_sizes <- as.integer(
+        fit$suppSize[[1]]
+      )
+
+
+      ## ------------------------------------------------------
+      ## Sort explicitly by decreasing lambda
+      ## ------------------------------------------------------
+
+      ord <- order(
+        fitted_lambda,
+        decreasing = TRUE
+      )
+
+
+      lambda_ordered <-
+        fitted_lambda[
+          ord
+        ]
+
+
+      size_ordered <-
+        support_sizes[
+          ord
+        ]
+
+
+      ## ------------------------------------------------------
+      ## Find jumps of more than one model size
+      ## ------------------------------------------------------
+
+      gap_indices <- which(
+        abs(
+          diff(
+            size_ordered
+          )
+        ) >
+          1
+      )
+
+
+      if (
+        length(
+          gap_indices
+        ) == 0
+      ) {
+
+        break
+      }
+
+
+      extra_lambda <- numeric(
+        0
+      )
+
+
+      for (
+        i in gap_indices
+      ) {
+
+        lambda_a <-
+          lambda_ordered[
+            i
+          ]
+
+
+        lambda_b <-
+          lambda_ordered[
+            i + 1
+          ]
+
+
+        upper <- max(
+          lambda_a,
+          lambda_b
+        )
+
+
+        lower <- min(
+          lambda_a,
+          lambda_b
+        )
+
+
+        if (
+          is.finite(
+            upper
+          ) &&
+            is.finite(
+              lower
+            ) &&
+            lower > 0 &&
+            upper > lower
+        ) {
+
+          local_grid <- exp(
+
+            seq(
+
+              from =
+                log(
+                  upper
+                ),
+
+              to =
+                log(
+                  lower
+                ),
+
+              length.out =
+                refine_points_per_gap +
+                2
+            )
+          )
+
+
+          ## Remove existing endpoints
+          local_grid <- local_grid[
+            -c(
+              1,
+              length(
+                local_grid
+              )
+            )
+          ]
+
+
+          extra_lambda <- c(
+            extra_lambda,
+            local_grid
+          )
+        }
+      }
+
+
+      if (
+        length(
+          extra_lambda
+        ) == 0
+      ) {
+
+        break
+      }
+
+
+      new_lambda_grid <- sort(
+
+        unique(
+          c(
+            lambda_grid,
+            extra_lambda
+          )
+        ),
+
+        decreasing = TRUE
+      )
+
+
+      if (
+        length(
+          new_lambda_grid
+        ) ==
+          length(
+            lambda_grid
+          )
+      ) {
+
+        break
+      }
+
+
+      lambda_grid <-
+        new_lambda_grid
+
+
+      refinement_rounds_used <-
+        rr
+
+
+      ## ------------------------------------------------------
+      ## Refit over refined grid
+      ## ------------------------------------------------------
+
+      fit <- run_cdpsi(
+        lambda_grid
+      )
+    }
+  }
+
+
+  ## ==========================================================
+  ## STEP 5
+  ## Final path
+  ## ==========================================================
+
+  support_sizes <- as.integer(
+    fit$suppSize[[1]]
+  )
+
+
+  fitted_lambda <- as.numeric(
+    fit$lambda[[1]]
+  )
+
+
+  beta_path <- as.matrix(
+    fit$beta[[1]]
+  )
+
+
+  available_sizes <- sort(
+    unique(
+      support_sizes[
+        support_sizes >= 1 &
+          support_sizes <= max_support
+      ]
+    )
+  )
+
+
+  missing_sizes <- setdiff(
+    seq_len(
+      max_support
+    ),
+    available_sizes
+  )
+
+
+  ## ==========================================================
+  ## STEP 6
+  ## Extract exact requested model size
+  ## ==========================================================
+
+  exact_indices <- which(
+    support_sizes ==
+      target_s
+  )
+
+
+  exact_size_available <-
+    length(
+      exact_indices
+    ) >
+    0
+
+
+  support <- integer(
+    0
+  )
+
+
+  selected_lambda <- NA_real_
+
+
+  if (
+    exact_size_available
+  ) {
+
+    candidate_rss <- rep(
+      NA_real_,
+      length(
+        exact_indices
+      )
+    )
+
+
+    candidate_supports <- vector(
+      mode = "list",
+      length = length(
+        exact_indices
+      )
+    )
+
+
+    for (
+      ii in seq_along(
+        exact_indices
+      )
+    ) {
+
+      j <- exact_indices[
+        ii
+      ]
+
+
+      beta_j <- beta_path[
+        ,
+        j
+      ]
+
+
+      support_j <- sort(
+        which(
+          abs(
+            beta_j
+          ) >
+            1e-10
+        )
+      )
+
+
+      candidate_supports[[
+        ii
+      ]] <-
+        support_j
+
+
+      candidate_rss[
+        ii
+      ] <- ols_refit(
+
+        X = X,
+
+        y = y,
+
+        support =
+          support_j
+
+      )$rss
+    }
+
+
+    best_candidate <- which.min(
+      candidate_rss
+    )
+
+
+    best_index <- exact_indices[
+      best_candidate
+    ]
+
+
+    support <- candidate_supports[[
+      best_candidate
+    ]]
+
+
+    selected_lambda <- fitted_lambda[
+      best_index
+    ]
+  }
+
+
+  ## ==========================================================
+  ## STEP 7
+  ## Nearest observed model size
+  ## ==========================================================
+
+  nearest_size <-
+
+    if (
+      length(
+        available_sizes
+      ) > 0
+    ) {
+
+      available_sizes[
+        which.min(
+          abs(
+            available_sizes -
+              target_s
+          )
+        )
+      ]
+
+    } else {
+
+      NA_integer_
+    }
+
+
+  runtime <-
+    proc.time()[3] -
+    total_start
+
+
+  list(
+
+    support =
+      support,
+
+    runtime =
+      runtime,
+
+    exact_size_available =
+      exact_size_available,
+
+    selected_lambda =
+      selected_lambda,
+
+    available_sizes =
+      available_sizes,
+
+    missing_sizes =
+      missing_sizes,
+
+    number_distinct_sizes =
+      length(
+        available_sizes
+      ),
+
+    nearest_size =
+      nearest_size,
+
+    refined =
+      refinement_rounds_used >
+      0,
+
+    refinement_rounds =
+      refinement_rounds_used,
+
+    number_lambda_values =
+      length(
+        fitted_lambda
+      ),
+
+    raw_support_sizes =
+      support_sizes,
+
+    fit =
+      fit
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 13
+## L0Learn wrapper
+## ============================================================
+
+fit_l0learn_method <- function(
+    X,
+    y,
+    s
+) {
+
+  fit_l0learn_dense(
+
+    X = X,
+
+    y = y,
+
+    target_s =
+      s,
+
+    max_support =
+      l0_max_support,
+
+    grid_points =
+      l0_grid_points,
+
+    upper_multiplier =
+      l0_upper_multiplier,
+
+    lower_multiplier =
+      l0_lower_multiplier,
+
+    refine_points_per_gap =
+      l0_refine_points_per_gap,
+
+    refine_rounds =
+      l0_refine_rounds
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 14
+## Safe fitting wrapper
+## ============================================================
+
+safe_fit <- function(
+    fit_function,
+    ...
+) {
+
+  tryCatch(
+
+    {
+
+      ans <- fit_function(
+        ...
+      )
+
+
+      ans$success <- TRUE
+
+      ans$error <- NA_character_
+
+
+      ans
+    },
+
+    error = function(e) {
+
+      list(
+
+        success =
+          FALSE,
+
+        support =
+          integer(0),
+
+        runtime =
+          NA_real_,
+
+        exact_size_available =
+          FALSE,
+
+        error =
+          conditionMessage(e)
+      )
+    }
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 15
+## Convert one fit into a result row
+## ============================================================
+
+make_result_row <- function(
+    rep_id,
+    snr,
+    s,
+    method,
+    fit,
+    data
+) {
+
+  ## ----------------------------------------------------------
+  ## Failed fit
+  ## ----------------------------------------------------------
+
+  if (!fit$success) {
+
+    return(
+      data.frame(
+
+        rep =
+          rep_id,
+
+        snr =
+          snr,
+
+        s =
+          s,
+
+        method =
+          method,
+
+        success =
+          FALSE,
+
+        exact_size_available =
+          FALSE,
+
+        selected_size =
+          NA_integer_,
+
+        exact_recovery =
+          NA,
+
+        TP =
+          NA_integer_,
+
+        FP =
+          NA_integer_,
+
+        FN =
+          NA_integer_,
+
+        precision =
+          NA_real_,
+
+        recall =
+          NA_real_,
+
+        jaccard =
+          NA_real_,
+
+        rss =
+          NA_real_,
+
+        runtime =
+          NA_real_,
+
+        sigma =
+          data$sigma,
+
+        realised_snr =
+          data$realised_snr,
+
+        support_key =
+          NA_character_,
+
+        true_support_key =
+          paste(
+            data$true_support,
+            collapse = ","
+          ),
+
+        cplex_status =
+          NA_character_,
+
+        cplex_gap =
+          NA_real_,
+
+        big_m_ratio =
+          NA_real_,
+
+        l0_distinct_sizes =
+          NA_integer_,
+
+        l0_available_sizes =
+          NA_character_,
+
+        l0_missing_sizes =
+          NA_character_,
+
+        l0_nearest_size =
+          NA_integer_,
+
+        l0_refined =
+          NA,
+
+        l0_refinement_rounds =
+          NA_integer_,
+
+        l0_lambda_points =
+          NA_integer_,
+
+        error =
+          fit$error,
+
+        stringsAsFactors =
+          FALSE
+      )
+    )
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Exact requested cardinality unavailable
+  ## ----------------------------------------------------------
+
+  if (!fit$exact_size_available) {
+
+    return(
+      data.frame(
+
+        rep =
+          rep_id,
+
+        snr =
+          snr,
+
+        s =
+          s,
+
+        method =
+          method,
+
+        success =
+          TRUE,
+
+        exact_size_available =
+          FALSE,
+
+        selected_size =
+          NA_integer_,
+
+        exact_recovery =
+          NA,
+
+        TP =
+          NA_integer_,
+
+        FP =
+          NA_integer_,
+
+        FN =
+          NA_integer_,
+
+        precision =
+          NA_real_,
+
+        recall =
+          NA_real_,
+
+        jaccard =
+          NA_real_,
+
+        rss =
+          NA_real_,
+
+        runtime =
+          fit$runtime,
+
+        sigma =
+          data$sigma,
+
+        realised_snr =
+          data$realised_snr,
+
+        support_key =
+          NA_character_,
+
+        true_support_key =
+          paste(
+            data$true_support,
+            collapse = ","
+          ),
+
+        cplex_status =
+          NA_character_,
+
+        cplex_gap =
+          NA_real_,
+
+        big_m_ratio =
+          NA_real_,
+
+        l0_distinct_sizes =
+          if (!is.null(
+            fit$number_distinct_sizes
+          )) {
+            fit$number_distinct_sizes
+          } else {
+            NA_integer_
+          },
+
+        l0_available_sizes =
+          if (!is.null(
+            fit$available_sizes
+          )) {
+            paste(
+              fit$available_sizes,
+              collapse = ","
+            )
+          } else {
+            NA_character_
+          },
+
+        l0_missing_sizes =
+          if (!is.null(
+            fit$missing_sizes
+          )) {
+            paste(
+              fit$missing_sizes,
+              collapse = ","
+            )
+          } else {
+            NA_character_
+          },
+
+        l0_nearest_size =
+          if (!is.null(
+            fit$nearest_size
+          )) {
+            fit$nearest_size
+          } else {
+            NA_integer_
+          },
+
+        l0_refined =
+          if (!is.null(
+            fit$refined
+          )) {
+            fit$refined
+          } else {
+            NA
+          },
+
+        l0_refinement_rounds =
+          if (!is.null(
+            fit$refinement_rounds
+          )) {
+            fit$refinement_rounds
+          } else {
+            NA_integer_
+          },
+
+        l0_lambda_points =
+          if (!is.null(
+            fit$number_lambda_values
+          )) {
+            fit$number_lambda_values
+          } else {
+            NA_integer_
+          },
+
+        error =
+          NA_character_,
+
+        stringsAsFactors =
+          FALSE
+      )
+    )
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Valid fixed-size solution
+  ## ----------------------------------------------------------
+
+  selected <- sort(
+    fit$support
+  )
+
+
+  metrics <- support_metrics(
+
+    selected =
+      selected,
+
+    truth =
+      data$true_support
+  )
+
+
+  refit <- ols_refit(
+
+    X =
+      data$X,
+
+    y =
+      data$y,
+
+    support =
+      selected
+  )
+
+
+  cplex_status <-
+
+    if (!is.null(
+      fit$status
+    )) {
+      fit$status
+    } else {
+      NA_character_
+    }
+
+
+  cplex_gap <-
+
+    if (!is.null(
+      fit$mip_gap
+    )) {
+      fit$mip_gap
+    } else {
+      NA_real_
+    }
+
+
+  big_m_ratio <-
+
+    if (!is.null(
+      fit$max_abs_beta
+    )) {
+      fit$max_abs_beta /
+        big_M
+    } else {
+      NA_real_
+    }
+
+
+  data.frame(
+
+    rep =
+      rep_id,
+
+    snr =
+      snr,
+
+    s =
+      s,
+
+    method =
+      method,
+
+    success =
+      TRUE,
+
+    exact_size_available =
+      TRUE,
+
+    selected_size =
+      length(
+        selected
+      ),
+
+    exact_recovery =
+      metrics$exact,
+
+    TP =
+      metrics$TP,
+
+    FP =
+      metrics$FP,
+
+    FN =
+      metrics$FN,
+
+    precision =
+      metrics$precision,
+
+    recall =
+      metrics$recall,
+
+    jaccard =
+      metrics$jaccard,
+
+    rss =
+      refit$rss,
+
+    runtime =
+      fit$runtime,
+
+    sigma =
+      data$sigma,
+
+    realised_snr =
+      data$realised_snr,
+
+    support_key =
+      paste(
+        selected,
+        collapse = ","
+      ),
+
+    true_support_key =
+      paste(
+        data$true_support,
+        collapse = ","
+      ),
+
+    cplex_status =
+      cplex_status,
+
+    cplex_gap =
+      cplex_gap,
+
+    big_m_ratio =
+      big_m_ratio,
+
+    l0_distinct_sizes =
+      if (!is.null(
+        fit$number_distinct_sizes
+      )) {
+        fit$number_distinct_sizes
+      } else {
+        NA_integer_
+      },
+
+    l0_available_sizes =
+      if (!is.null(
+        fit$available_sizes
+      )) {
+        paste(
+          fit$available_sizes,
+          collapse = ","
+        )
+      } else {
+        NA_character_
+      },
+
+    l0_missing_sizes =
+      if (!is.null(
+        fit$missing_sizes
+      )) {
+        paste(
+          fit$missing_sizes,
+          collapse = ","
+        )
+      } else {
+        NA_character_
+      },
+
+    l0_nearest_size =
+      if (!is.null(
+        fit$nearest_size
+      )) {
+        fit$nearest_size
+      } else {
+        NA_integer_
+      },
+
+    l0_refined =
+      if (!is.null(
+        fit$refined
+      )) {
+        fit$refined
+      } else {
+        NA
+      },
+
+    l0_refinement_rounds =
+      if (!is.null(
+        fit$refinement_rounds
+      )) {
+        fit$refinement_rounds
+      } else {
+        NA_integer_
+      },
+
+    l0_lambda_points =
+      if (!is.null(
+        fit$number_lambda_values
+      )) {
+        fit$number_lambda_values
+      } else {
+        NA_integer_
+      },
+
+    error =
+      NA_character_,
+
+    stringsAsFactors =
+      FALSE
+  )
+}
+```
+
+
+```{r}
+## ============================================================
+## SECTION 16
+## Sanity check
+## ============================================================
+
+test_base <- generate_replication_base(
+
+  rep_id = 1,
+
+  n = n,
+
+  p = p,
+
+  rho = rho,
+
+  s_true =
+    s_true,
+
+  beta_min =
+    beta_min,
+
+  beta_max =
+    beta_max,
+
+  master_seed =
+    master_seed
+)
+
+
+test_data <- make_dataset_snr(
+
+  base =
+    test_base,
+
+  target_snr = 2
+)
+
+
+cat(
+  "True support:",
+  paste(
+    test_data$true_support,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+cat(
+  "Realised SNR:",
+  round(
+    test_data$realised_snr,
+    5
+  ),
+  "\n\n"
+)
+
+
+test_cplex <- safe_fit(
+
+  fit_cplex_method,
+
+  X =
+    test_data$X,
+
+  y =
+    test_data$y,
+
+  s =
+    s_true,
+
+  M =
+    big_M
+)
+
+
+test_combss <- safe_fit(
+
+  fit_combss_method,
+
+  X =
+    test_data$X,
+
+  y =
+    test_data$y,
+
+  s =
+    s_true
+)
+
+
+test_abess <- safe_fit(
+
+  fit_abess_method,
+
+  X =
+    test_data$X,
+
+  y =
+    test_data$y,
+
+  s =
+    s_true
+)
+
+
+test_l0learn <- safe_fit(
+
+  fit_l0learn_method,
+
+  X =
+    test_data$X,
+
+  y =
+    test_data$y,
+
+  s =
+    s_true
+)
+
+
+cat(
+  "\nCPLEX support:",
+  paste(
+    test_cplex$support,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+cat(
+  "COMBSS support:",
+  paste(
+    test_combss$support,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+cat(
+  "ABESS support:",
+  paste(
+    test_abess$support,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+if (
+  test_l0learn$exact_size_available
+) {
+
+  cat(
+    "L0Learn support:",
+    paste(
+      test_l0learn$support,
+      collapse = ", "
+    ),
+    "\n"
+  )
+
+} else {
+
+  cat(
+    "L0Learn did not produce model size",
+    s_true,
+    "\n"
+  )
+}
+
+
+cat(
+  "\nL0Learn available sizes:",
+  paste(
+    test_l0learn$available_sizes,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+cat(
+  "L0Learn missing sizes up to",
+  l0_max_support,
+  ":",
+  paste(
+    test_l0learn$missing_sizes,
+    collapse = ", "
+  ),
+  "\n"
+)
+
+
+cat(
+  "Number of distinct sizes:",
+  test_l0learn$number_distinct_sizes,
+  "\n"
+)
+
+
+cat(
+  "Refinement rounds used:",
+  test_l0learn$refinement_rounds,
+  "\n"
+)
+
+
+cat(
+  "Final lambda grid size:",
+  test_l0learn$number_lambda_values,
+  "\n"
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 17
+## Main Experiment 2
+## ============================================================
+
+dir.create(
+  "experiment2_results",
+  showWarnings = FALSE
+)
+
+
+results_list <- list()
+
+
+row_counter <- 1
+
+
+experiment_start <- Sys.time()
+
+
+for (
+  r in seq_len(
+    n_rep
+  )
+) {
+
+  cat("\n")
+  cat(
+    "============================================================\n"
+  )
+
+  cat(
+    "REPLICATION",
+    r,
+    "OF",
+    n_rep,
+    "\n"
+  )
+
+  cat(
+    "============================================================\n"
+  )
+
+
+  ## ----------------------------------------------------------
+  ## Generate one base simulation.
+  ##
+  ## This is held fixed across all SNR values.
+  ## ----------------------------------------------------------
+
+  base <- generate_replication_base(
+
+    rep_id =
+      r,
+
+    n =
+      n,
+
+    p =
+      p,
+
+    rho =
+      rho,
+
+    s_true =
+      s_true,
+
+    beta_min =
+      beta_min,
+
+    beta_max =
+      beta_max,
+
+    master_seed =
+      master_seed
+  )
+
+
+  for (
+    snr in snr_values
+  ) {
+
+    cat(
+      "\nSNR =",
+      snr,
+      "\n"
+    )
+
+
+    ## --------------------------------------------------------
+    ## Construct response at requested SNR
+    ## --------------------------------------------------------
+
+    data <- make_dataset_snr(
+
+      base =
+        base,
+
+      target_snr =
+        snr
+    )
+
+
+    cat(
+      "Realised SNR =",
+      round(
+        data$realised_snr,
+        5
+      ),
+      "\n"
+    )
+
+
+    ## ========================================================
+    ## CPLEX
+    ## ========================================================
+
+    cat(
+      "  CPLEX...\n"
+    )
+
+
+    fit <- safe_fit(
+
+      fit_cplex_method,
+
+      X =
+        data$X,
+
+      y =
+        data$y,
+
+      s =
+        s_true,
+
+      M =
+        big_M
+    )
+
+
+    results_list[[
+      row_counter
+    ]] <- make_result_row(
+
+      rep_id =
+        r,
+
+      snr =
+        snr,
+
+      s =
+        s_true,
+
+      method =
+        "CPLEX",
+
+      fit =
+        fit,
+
+      data =
+        data
+    )
+
+
+    row_counter <-
+      row_counter +
+      1
+
+
+    ## ========================================================
+    ## COMBSS
+    ## ========================================================
+
+    cat(
+      "  COMBSS...\n"
+    )
+
+
+    fit <- safe_fit(
+
+      fit_combss_method,
+
+      X =
+        data$X,
+
+      y =
+        data$y,
+
+      s =
+        s_true
+    )
+
+
+    results_list[[
+      row_counter
+    ]] <- make_result_row(
+
+      rep_id =
+        r,
+
+      snr =
+        snr,
+
+      s =
+        s_true,
+
+      method =
+        "COMBSS",
+
+      fit =
+        fit,
+
+      data =
+        data
+    )
+
+
+    row_counter <-
+      row_counter +
+      1
+
+
+    ## ========================================================
+    ## ABESS
+    ## ========================================================
+
+    cat(
+      "  ABESS...\n"
+    )
+
+
+    fit <- safe_fit(
+
+      fit_abess_method,
+
+      X =
+        data$X,
+
+      y =
+        data$y,
+
+      s =
+        s_true
+    )
+
+
+    results_list[[
+      row_counter
+    ]] <- make_result_row(
+
+      rep_id =
+        r,
+
+      snr =
+        snr,
+
+      s =
+        s_true,
+
+      method =
+        "ABESS",
+
+      fit =
+        fit,
+
+      data =
+        data
+    )
+
+
+    row_counter <-
+      row_counter +
+      1
+
+
+    ## ========================================================
+    ## L0Learn
+    ## ========================================================
+
+    cat(
+      "  L0Learn...\n"
+    )
+
+
+    fit <- safe_fit(
+
+      fit_l0learn_method,
+
+      X =
+        data$X,
+
+      y =
+        data$y,
+
+      s =
+        s_true
+    )
+
+
+    results_list[[
+      row_counter
+    ]] <- make_result_row(
+
+      rep_id =
+        r,
+
+      snr =
+        snr,
+
+      s =
+        s_true,
+
+      method =
+        "L0Learn",
+
+      fit =
+        fit,
+
+      data =
+        data
+    )
+
+
+    row_counter <-
+      row_counter +
+      1
+  }
+
+
+  ## ----------------------------------------------------------
+  ## Save after each entire replication
+  ## ----------------------------------------------------------
+
+  checkpoint <- bind_rows(
+    results_list
+  )
+
+
+  saveRDS(
+
+    checkpoint,
+
+    file =
+      "experiment2_results/experiment2_checkpoint.rds"
+  )
+
+
+  cat(
+    "\nReplication",
+    r,
+    "saved.\n"
+  )
+}
+
+
+experiment_end <- Sys.time()
+
+
+results <- bind_rows(
+  results_list
+)
+
+
+cat(
+  "\nExperiment 2 completed.\n"
+)
+
+
+cat(
+  "Total elapsed time:",
+  as.character(
+    experiment_end -
+      experiment_start
+  ),
+  "\n"
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 18
+## Failed fits
+## ============================================================
+
+failed_fits <- results %>%
+
+  filter(
+    !success
+  ) %>%
+
+  select(
+    rep,
+    snr,
+    method,
+    error
+  )
+
+
+print(
+  failed_fits
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 19
+## CPLEX diagnostics
+## ============================================================
+
+cplex_diagnostics <- results %>%
+
+  filter(
+    method ==
+      "CPLEX"
+  ) %>%
+
+  select(
+    rep,
+    snr,
+    cplex_status,
+    cplex_gap,
+    big_m_ratio,
+    runtime
+  )
+
+
+print(
+  cplex_diagnostics
+)
+
+
+cat(
+  "\nAll CPLEX solutions optimal:",
+  all(
+    grepl(
+      "optimal",
+      cplex_diagnostics$cplex_status,
+      ignore.case = TRUE
+    )
+  ),
+  "\n"
+)
+
+
+cat(
+  "Maximum CPLEX gap:",
+  max(
+    cplex_diagnostics$cplex_gap,
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+
+cat(
+  "Maximum Big-M utilisation:",
+  max(
+    cplex_diagnostics$big_m_ratio,
+    na.rm = TRUE
+  ),
+  "\n"
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 20
+## L0Learn model-size coverage
+## ============================================================
+
+l0learn_diagnostics <- results %>%
+
+  filter(
+    method ==
+      "L0Learn"
+  ) %>%
+
+  select(
+    rep,
+    snr,
+    exact_size_available,
+    l0_distinct_sizes,
+    l0_available_sizes,
+    l0_missing_sizes,
+    l0_nearest_size,
+    l0_refined,
+    l0_refinement_rounds,
+    l0_lambda_points,
+    runtime
+  )
+
+
+print(
+  l0learn_diagnostics
+)
+
+
+l0learn_size_availability <- results %>%
+
+  filter(
+    method ==
+      "L0Learn"
+  ) %>%
+
+  group_by(
+    snr
+  ) %>%
+
+  summarise(
+
+    exact_size_rate =
+      mean(
+        exact_size_available
+      ),
+
+    mean_distinct_sizes =
+      mean(
+        l0_distinct_sizes,
+        na.rm = TRUE
+      ),
+
+    median_distinct_sizes =
+      median(
+        l0_distinct_sizes,
+        na.rm = TRUE
+      ),
+
+    refinement_rate =
+      mean(
+        l0_refined,
+        na.rm = TRUE
+      ),
+
+    mean_refinement_rounds =
+      mean(
+        l0_refinement_rounds,
+        na.rm = TRUE
+      ),
+
+    mean_lambda_points =
+      mean(
+        l0_lambda_points,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+print(
+  l0learn_size_availability
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 21
+## CPLEX comparison metrics
+## ============================================================
+
+cplex_reference <- results %>%
+
+  filter(
+    method ==
+      "CPLEX",
+    success,
+    exact_size_available
+  ) %>%
+
+  select(
+
+    rep,
+
+    snr,
+
+    s,
+
+    cplex_support_key =
+      support_key,
+
+    cplex_rss =
+      rss
+  )
+
+
+results <- results %>%
+
+  left_join(
+
+    cplex_reference,
+
+    by = c(
+      "rep",
+      "snr",
+      "s"
+    )
+  ) %>%
+
+  mutate(
+
+    agrees_with_cplex =
+
+      ifelse(
+
+        success &
+          exact_size_available &
+          !is.na(
+            cplex_support_key
+          ),
+
+        support_key ==
+          cplex_support_key,
+
+        NA
+      ),
+
+
+    relative_rss_gap =
+
+      ifelse(
+
+        success &
+          exact_size_available &
+          !is.na(
+            cplex_rss
+          ),
+
+        (
+          rss -
+            cplex_rss
+        ) /
+          cplex_rss,
+
+        NA_real_
+      )
+  )
+```
+
+
+```{r}
+## ============================================================
+## SECTION 22
+## Check RSS gaps against CPLEX
+## ============================================================
+
+results %>%
+
+  filter(
+    method !=
+      "CPLEX",
+    exact_size_available
+  ) %>%
+
+  summarise(
+
+    minimum_gap =
+      min(
+        relative_rss_gap,
+        na.rm = TRUE
+      ),
+
+    maximum_gap =
+      max(
+        relative_rss_gap,
+        na.rm = TRUE
+      )
+  )
+```
+
+
+```{r}
+## ============================================================
+## SECTION 23
+## Summary
+## ============================================================
+
+mean_safe <- function(x) {
+
+  if (all(
+    is.na(x)
+  )) {
+
+    return(
+      NA_real_
+    )
+  }
+
+
+  mean(
+    x,
+    na.rm = TRUE
+  )
+}
+
+
+median_safe <- function(x) {
+
+  if (all(
+    is.na(x)
+  )) {
+
+    return(
+      NA_real_
+    )
+  }
+
+
+  median(
+    x,
+    na.rm = TRUE
+  )
+}
+
+
+summary_results <- results %>%
+
+  group_by(
+    snr,
+    method
+  ) %>%
+
+  summarise(
+
+    replications =
+      n(),
+
+    successful_runs =
+      sum(
+        success
+      ),
+
+    exact_size_rate =
+      mean(
+        exact_size_available
+      ),
+
+    exact_recovery_rate =
+      mean_safe(
+        as.numeric(
+          exact_recovery
+        )
+      ),
+
+    mean_TP =
+      mean_safe(
+        TP
+      ),
+
+    mean_FP =
+      mean_safe(
+        FP
+      ),
+
+    mean_FN =
+      mean_safe(
+        FN
+      ),
+
+    mean_precision =
+      mean_safe(
+        precision
+      ),
+
+    mean_recall =
+      mean_safe(
+        recall
+      ),
+
+    mean_jaccard =
+      mean_safe(
+        jaccard
+      ),
+
+    cplex_agreement_rate =
+      mean_safe(
+        as.numeric(
+          agrees_with_cplex
+        )
+      ),
+
+    median_relative_rss_gap =
+      median_safe(
+        relative_rss_gap
+      ),
+
+    median_runtime =
+      median_safe(
+        runtime
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+print(
+  summary_results
+)
+```
+
+
+```{r}
+## ============================================================
+## SECTION 24
+## Exact support recovery versus SNR
+## ============================================================
+
+recovery_plot_data <- results %>%
+
+  filter(
+    success,
+    exact_size_available
+  ) %>%
+
+  group_by(
+    snr,
+    method
+  ) %>%
+
+  summarise(
+
+    recovery_rate =
+      mean(
+        exact_recovery
+      ),
+
+    n =
+      n(),
+
+    .groups =
+      "drop"
+  ) %>%
+
+  mutate(
+
+    se =
+      sqrt(
+        recovery_rate *
+          (
+            1 -
+              recovery_rate
+          ) /
+          n
+      ),
+
+    lower =
+      pmax(
+        0,
+        recovery_rate -
+          1.96 *
+          se
+      ),
+
+    upper =
+      pmin(
+        1,
+        recovery_rate +
+          1.96 *
+          se
+      )
+  )
+
+
+p_recovery <- ggplot(
+
+  recovery_plot_data,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      recovery_rate,
+
+    group =
+      method,
+
+    linetype =
+      method,
+
+    shape =
+      method
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  geom_errorbar(
+
+    aes(
+      ymin =
+        lower,
+
+      ymax =
+        upper
+    ),
+
+    width = 0.05
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  scale_y_continuous(
+    limits = c(
+      0,
+      1
+    )
+  ) +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      "Exact support recovery rate",
+
+    linetype =
+      "Method",
+
+    shape =
+      "Method"
+  ) +
+
+  theme_minimal()
+
+
+p_recovery
+```
+
+
+```{r}
+## ============================================================
+## SECTION 25
+## Jaccard similarity versus SNR
+## ============================================================
+
+jaccard_plot_data <- results %>%
+
+  filter(
+    success,
+    exact_size_available
+  ) %>%
+
+  group_by(
+    snr,
+    method
+  ) %>%
+
+  summarise(
+
+    mean_jaccard =
+      mean(
+        jaccard,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+p_jaccard <- ggplot(
+
+  jaccard_plot_data,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      mean_jaccard,
+
+    group =
+      method,
+
+    linetype =
+      method,
+
+    shape =
+      method
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  scale_y_continuous(
+    limits = c(
+      0,
+      1
+    )
+  ) +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      "Mean Jaccard similarity",
+
+    linetype =
+      "Method",
+
+    shape =
+      "Method"
+  ) +
+
+  theme_minimal()
+
+
+p_jaccard
+```
+
+
+```{r}
+## ============================================================
+## SECTION 26
+## Agreement with CPLEX
+## ============================================================
+
+agreement_plot_data <- results %>%
+
+  filter(
+    method !=
+      "CPLEX",
+    success,
+    exact_size_available
+  ) %>%
+
+  group_by(
+    snr,
+    method
+  ) %>%
+
+  summarise(
+
+    agreement =
+      mean(
+        agrees_with_cplex,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+p_agreement <- ggplot(
+
+  agreement_plot_data,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      agreement,
+
+    group =
+      method,
+
+    linetype =
+      method,
+
+    shape =
+      method
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  scale_y_continuous(
+    limits = c(
+      0,
+      1
+    )
+  ) +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      "Agreement with CPLEX",
+
+    linetype =
+      "Method",
+
+    shape =
+      "Method"
+  ) +
+
+  theme_minimal()
+
+
+p_agreement
+```
+
+
+```{r}
+## ============================================================
+## SECTION 27
+## Relative RSS gap from CPLEX
+## ============================================================
+
+gap_plot_data <- results %>%
+
+  filter(
+    method !=
+      "CPLEX",
+    success,
+    exact_size_available
+  ) %>%
+
+  mutate(
+
+    relative_rss_gap =
+      pmax(
+        relative_rss_gap,
+        0
+      )
+  ) %>%
+
+  group_by(
+    snr,
+    method
+  ) %>%
+
+  summarise(
+
+    median_gap =
+      median(
+        relative_rss_gap,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+p_gap <- ggplot(
+
+  gap_plot_data,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      median_gap +
+      1e-12,
+
+    group =
+      method,
+
+    linetype =
+      method,
+
+    shape =
+      method
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  scale_y_log10() +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      "Median relative RSS gap from CPLEX",
+
+    linetype =
+      "Method",
+
+    shape =
+      "Method"
+  ) +
+
+  theme_minimal()
+
+
+p_gap
+```
+
+
+```{r}
+## ============================================================
+## SECTION 28
+## Runtime versus SNR
+## ============================================================
+
+runtime_plot_data <- results %>%
+
+  filter(
+    success
+  ) %>%
+
+  group_by(
+    snr,
+    method
+  ) %>%
+
+  summarise(
+
+    median_runtime =
+      median(
+        runtime,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+p_runtime <- ggplot(
+
+  runtime_plot_data,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      median_runtime,
+
+    group =
+      method,
+
+    linetype =
+      method,
+
+    shape =
+      method
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  scale_y_log10() +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      "Median runtime (seconds)",
+
+    linetype =
+      "Method",
+
+    shape =
+      "Method"
+  ) +
+
+  theme_minimal()
+
+
+p_runtime
+```
+
+
+```{r}
+## ============================================================
+## SECTION 29
+## L0Learn target-size availability
+## ============================================================
+
+p_l0_availability <- ggplot(
+
+  l0learn_size_availability,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      exact_size_rate
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  scale_y_continuous(
+    limits = c(
+      0,
+      1
+    )
+  ) +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      paste0(
+        "Proportion of L0Learn paths containing size ",
+        s_true
+      )
+  ) +
+
+  theme_minimal()
+
+
+p_l0_availability
+```
+
+
+```{r}
+## ============================================================
+## SECTION 30
+## Number of distinct L0Learn model sizes
+## ============================================================
+
+l0_distinct_plot_data <- results %>%
+
+  filter(
+    method ==
+      "L0Learn"
+  ) %>%
+
+  group_by(
+    snr
+  ) %>%
+
+  summarise(
+
+    mean_distinct_sizes =
+      mean(
+        l0_distinct_sizes,
+        na.rm = TRUE
+      ),
+
+    median_distinct_sizes =
+      median(
+        l0_distinct_sizes,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+p_l0_distinct <- ggplot(
+
+  l0_distinct_plot_data,
+
+  aes(
+
+    x =
+      snr,
+
+    y =
+      mean_distinct_sizes
+  )
+
+) +
+
+  geom_line() +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  scale_x_log10(
+
+    breaks =
+      snr_values,
+
+    labels =
+      snr_values
+  ) +
+
+  labs(
+
+    x =
+      "Signal-to-noise ratio",
+
+    y =
+      "Mean number of distinct L0Learn model sizes"
+  ) +
+
+  theme_minimal()
+
+
+p_l0_distinct
+```
+
+
