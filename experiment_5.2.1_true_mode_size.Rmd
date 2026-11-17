@@ -1,0 +1,4959 @@
+---
+title: 'Experiment 5.2.1: True Model Size'
+author: "Benjamin Wilson"
+date: "2026-11-08"
+output: html_document
+---
+
+```{r}
+# Section 1
+# Install and load required packages
+options(
+  repos = c(
+    CRAN = "https://cloud.r-project.org"
+  )
+)
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+if (!requireNamespace("L0Learn", quietly = TRUE)) {
+  remotes::install_github(
+    "hazimehh/L0Learn",
+    dependencies = TRUE,
+    upgrade = "never"
+  )
+}
+if (!requireNamespace("combss", quietly = TRUE)) {
+  remotes::install_github(
+    "benoit-liquet/combss",
+    dependencies = TRUE,
+    upgrade = "never"
+  )
+}
+cran_packages <- c(
+  "abess",
+  "dplyr",
+  "ggplot2"
+)
+for (pkg in cran_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+suppressPackageStartupMessages({
+  library(L0Learn)
+  library(combss)
+  library(abess)
+  library(dplyr)
+  library(ggplot2)
+})
+# Reduce uncontrolled parallelism
+Sys.setenv(
+  OMP_THREAD_LIMIT = "1",
+  OMP_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1"
+)
+cat("Packages loaded successfully.\n")
+cat("L0Learn:", as.character(packageVersion("L0Learn")), "\n")
+cat("COMBSS:", as.character(packageVersion("combss")), "\n")
+cat("ABESS:", as.character(packageVersion("abess")), "\n")
+```
+
+```{r}
+# Section 2
+# Set up Python and IBM CPLEX
+python_bin <- Sys.which(
+  "python3"
+)
+if (python_bin == "") {
+  stop(
+    "python3 was not found. Install Python 3 before continuing."
+  )
+}
+run_python_command <- function(args) {
+  out <- system2(
+    python_bin,
+    args = args,
+    stdout = TRUE,
+    stderr = TRUE
+  )
+  status <- attr(
+    out,
+    "status"
+  )
+  if (is.null(status)) {
+    status <- 0L
+  }
+  list(
+    output = out,
+    status = status
+  )
+}
+check_cplex <- run_python_command(
+  c(
+    "-c",
+    shQuote(
+      "import cplex; print(cplex.__version__)"
+    )
+  )
+)
+if (check_cplex$status != 0) {
+  cat(
+    "Python CPLEX package not found. Attempting installation...\n"
+  )
+  system2(
+    python_bin,
+    args = c(
+      "-m",
+      "pip",
+      "install",
+      "cplex",
+      "docplex"
+    )
+  )
+  check_cplex <- run_python_command(
+    c(
+      "-c",
+      shQuote(
+        "import cplex; print(cplex.__version__)"
+      )
+    )
+  )
+}
+if (check_cplex$status != 0) {
+  stop(
+    "CPLEX could not be imported into Python."
+  )
+}
+cat(
+  "Using Python:",
+  python_bin,
+  "\n"
+)
+cat(
+  "CPLEX version:",
+  paste(
+    check_cplex$output,
+    collapse = " "
+  ),
+  "\n"
+)
+```
+
+```{r}
+# Section 3
+# Create Python CPLEX solver
+CPLEX_SOLVER_SCRIPT <- file.path(
+  tempdir(),
+  "solve_cplex.py"
+)
+python_solver <- c(
+  "import sys",
+  "import cplex",
+  "",
+  "lpfile = sys.argv[1]",
+  "solfile = sys.argv[2]",
+  "",
+  "problem = cplex.Cplex(lpfile)",
+  "",
+  "problem.set_log_stream(sys.stdout)",
+  "problem.set_warning_stream(sys.stdout)",
+  "problem.set_results_stream(sys.stdout)",
+  "",
+  "problem.parameters.threads.set(1)",
+  "",
+  "problem.parameters.mip.tolerances.mipgap.set(1e-6)",
+  "",
+  "problem.solve()",
+  "",
+  "status = problem.solution.get_status_string()",
+  "print('CPLEX status:', status)",
+  "",
+  "if not problem.solution.is_primal_feasible():",
+  "    print('No primal feasible solution found.')",
+  "    sys.exit(2)",
+  "",
+  "objective = problem.solution.get_objective_value()",
+  "print('Objective:', objective)",
+  "",
+  "try:",
+  "    gap = problem.solution.MIP.get_mip_relative_gap()",
+  "    print('MIP gap:', gap)",
+  "except:",
+  "    pass",
+  "",
+  "problem.solution.write(solfile)"
+)
+writeLines(
+  python_solver,
+  CPLEX_SOLVER_SCRIPT
+)
+cat(
+  "Created CPLEX solver at:\n",
+  CPLEX_SOLVER_SCRIPT,
+  "\n"
+)
+```
+
+```{r}
+# Section 4
+# Exact fixed-size best subset selection using CPLEX
+best_subset_cplex <- function(
+    X,
+    y,
+    s,
+    M = 20
+) {
+  n <- nrow(X)
+  p <- ncol(X)
+  work <- tempfile(
+    "cplex_"
+  )
+  dir.create(
+    work
+  )
+  on.exit(
+    unlink(
+      work,
+      recursive = TRUE
+    ),
+    add = TRUE
+  )
+  lpfile <- file.path(
+    work,
+    "model.lp"
+  )
+  solfile <- file.path(
+    work,
+    "solution.sol"
+  )
+  con <- file(
+    lpfile,
+    "wt"
+  )
+  # Objective
+  writeLines(
+    "Minimize",
+    con
+  )
+  writeLines(
+    " obj: [",
+    con
+  )
+  for (i in seq_len(n)) {
+    writeLines(
+      sprintf(
+        " + 2 r_%d ^ 2",
+        i
+      ),
+      con
+    )
+  }
+  writeLines(
+    " ] / 2",
+    con
+  )
+  # Residual constraints
+  writeLines(
+    "Subject To",
+    con
+  )
+  chunk <- 10
+  for (i in seq_len(n)) {
+    starts <- seq(
+      1,
+      p,
+      by = chunk
+    )
+    for (cc in seq_along(starts)) {
+      start <- starts[cc]
+      finish <- min(
+        start + chunk - 1,
+        p
+      )
+      txt <- ""
+      if (cc == 1) {
+        txt <- sprintf(
+          " resid_%d:",
+          i
+        )
+      }
+      for (j in start:finish) {
+        a <- X[
+          i,
+          j
+        ]
+        if (abs(a) < 1e-14) {
+          next
+        }
+        if (a >= 0) {
+          txt <- paste0(
+            txt,
+            sprintf(
+              " + %.12g beta_%d",
+              a,
+              j
+            )
+          )
+        } else {
+          txt <- paste0(
+            txt,
+            sprintf(
+              " - %.12g beta_%d",
+              -a,
+              j
+            )
+          )
+        }
+      }
+      if (finish == p) {
+        txt <- paste0(
+          txt,
+          sprintf(
+            " + r_%d = %.12g",
+            i,
+            y[i]
+          )
+        )
+      }
+      writeLines(
+        txt,
+        con
+      )
+    }
+  }
+  # Big-M linking constraints
+  for (j in seq_len(p)) {
+    writeLines(
+      sprintf(
+        " U%d: beta_%d - %.12g z_%d <= 0",
+        j,
+        j,
+        M,
+        j
+      ),
+      con
+    )
+    writeLines(
+      sprintf(
+        " L%d: - beta_%d - %.12g z_%d <= 0",
+        j,
+        j,
+        M,
+        j
+      ),
+      con
+    )
+  }
+  # Exactly s predictors
+  writeLines(
+    " card:",
+    con
+  )
+  chunk_z <- 25
+  for (
+    start in seq(
+      1,
+      p,
+      by = chunk_z
+    )
+  ) {
+    finish <- min(
+      start + chunk_z - 1,
+      p
+    )
+    txt <- ""
+    for (j in start:finish) {
+      txt <- paste0(
+        txt,
+        sprintf(
+          " + z_%d",
+          j
+        )
+      )
+    }
+    if (finish == p) {
+      txt <- paste0(
+        txt,
+        sprintf(
+          " = %d",
+          s
+        )
+      )
+    }
+    writeLines(
+      txt,
+      con
+    )
+  }
+  # Bounds
+  writeLines(
+    "Bounds",
+    con
+  )
+  for (j in seq_len(p)) {
+    writeLines(
+      sprintf(
+        " -%.12g <= beta_%d <= %.12g",
+        M,
+        j,
+        M
+      ),
+      con
+    )
+  }
+  for (i in seq_len(n)) {
+    writeLines(
+      sprintf(
+        " r_%d free",
+        i
+      ),
+      con
+    )
+  }
+  # Binary variables
+  writeLines(
+    "Binary",
+    con
+  )
+  for (
+    start in seq(
+      1,
+      p,
+      by = 25
+    )
+  ) {
+    finish <- min(
+      start + 24,
+      p
+    )
+    txt <- ""
+    for (j in start:finish) {
+      txt <- paste0(
+        txt,
+        sprintf(
+          " z_%d",
+          j
+        )
+      )
+    }
+    writeLines(
+      txt,
+      con
+    )
+  }
+  writeLines(
+    "End",
+    con
+  )
+  close(
+    con
+  )
+  # Solve
+  solve_start <- proc.time()[3]
+  out <- system2(
+    python_bin,
+    args = c(
+      shQuote(
+        CPLEX_SOLVER_SCRIPT
+      ),
+      shQuote(
+        lpfile
+      ),
+      shQuote(
+        solfile
+      )
+    ),
+    stdout = TRUE,
+    stderr = TRUE
+  )
+  solve_seconds <-
+    proc.time()[3] -
+      solve_start
+  if (!file.exists(solfile)) {
+    cat(
+      paste(
+        out,
+        collapse = "\n"
+      ),
+      "\n"
+    )
+    stop(
+      "CPLEX did not produce a solution."
+    )
+  }
+  # Status
+  status_line <- grep(
+    "^CPLEX status:",
+    out,
+    value = TRUE
+  )
+  cplex_status <-
+    if (length(status_line) > 0) {
+      sub(
+        "^CPLEX status:[[:space:]]*",
+        "",
+        status_line[1]
+      )
+    } else {
+      NA_character_
+    }
+  # MIP gap
+  gap_line <- grep(
+    "^MIP gap:",
+    out,
+    value = TRUE
+  )
+  mip_gap <-
+    if (length(gap_line) > 0) {
+      as.numeric(
+        sub(
+          "^MIP gap:[[:space:]]*",
+          "",
+          gap_line[1]
+        )
+      )
+    } else {
+      NA_real_
+    }
+  # Read CPLEX XML solution
+  sol <- readLines(
+    solfile,
+    warn = FALSE
+  )
+  beta <- numeric(
+    p
+  )
+  z <- numeric(
+    p
+  )
+  for (line in sol) {
+    if (!grepl(
+      "<variable",
+      line,
+      fixed = TRUE
+    )) {
+      next
+    }
+    name_match <- regmatches(
+      line,
+      regexec(
+        'name="([^"]+)"',
+        line,
+        perl = TRUE
+      )
+    )[[1]]
+    if (length(name_match) != 2) {
+      next
+    }
+    name <- name_match[2]
+    value_match <- regmatches(
+      line,
+      regexec(
+        'value="([-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)"',
+        line,
+        perl = TRUE
+      )
+    )[[1]]
+    if (length(value_match) != 2) {
+      next
+    }
+    value <- as.numeric(
+      value_match[2]
+    )
+    if (grepl(
+      "^beta_[0-9]+$",
+      name
+    )) {
+      j <- as.integer(
+        sub(
+          "^beta_",
+          "",
+          name
+        )
+      )
+      if (!is.na(j) && j <= p) {
+        beta[j] <- value
+      }
+    }
+    if (grepl(
+      "^z_[0-9]+$",
+      name
+    )) {
+      j <- as.integer(
+        sub(
+          "^z_",
+          "",
+          name
+        )
+      )
+      if (!is.na(j) && j <= p) {
+        z[j] <- value
+      }
+    }
+  }
+  selected <- which(
+    z > 0.5
+  )
+  rss <- sum(
+    (
+      y -
+        as.vector(
+          X %*% beta
+        )
+    )^2
+  )
+  max_abs_beta <- max(
+    abs(
+      beta
+    )
+  )
+  list(
+    beta = beta,
+    selected = selected,
+    rss = rss,
+    status = cplex_status,
+    mip_gap = mip_gap,
+    solve_seconds = solve_seconds,
+    max_abs_beta = max_abs_beta,
+    cplex_output = out
+  )
+}
+```
+
+```{r}
+# Section 5
+# Experiment settings
+# Effect of true model size on model-size identification
+# Baseline data-generating process
+n <- 200
+p <- 50
+rho <- 0.20
+# Population SNR held fixed across true model sizes
+target_snr <- 60
+# True model sizes
+#
+# With k_max = 8 and two points required on either side of the
+# breakpoint, the possible piecewise estimates are 3, 4, 5, 6.
+true_sizes <- c(
+  3,
+  4,
+  5,
+  6
+)
+max_true_size <- max(
+  true_sizes
+)
+# Candidate fitted model sizes
+k_values <- 1:8
+k_max <- max(
+  k_values
+)
+# Monte Carlo replications
+n_rep <- 40
+# Use temporarily while checking that everything runs:
+# n_rep <- 2
+# True coefficient magnitudes
+beta_min <- 1
+beta_max <- 2
+# CPLEX
+big_M <- 20
+# L0Learn
+l0_max_support <- k_max
+l0_grid_points <- 1200
+l0_upper_multiplier <- 2
+l0_lower_multiplier <- 0.02
+l0_refine_points_per_gap <- 100
+l0_refine_rounds <- 2
+# Piecewise-linear breakpoint settings
+min_left_points <- 2
+min_right_points <- 2
+# Numerical floor
+#
+# Only used when taking log10 R(k).
+# R(k) itself is not changed.
+ratio_floor <- 1e-16
+# Reproducibility
+master_seed <- 12345
+# Output directory
+#
+# Use a new directory so results from the old SNR = 2 run
+# cannot be mixed with the corrected experiment.
+output_dir <-
+  "experiment5_2_1_true_model_size_snr60_results"
+dir.create(
+  output_dir,
+  showWarnings = FALSE
+)
+checkpoint_file <- file.path(
+  output_dir,
+  "checkpoint_populationSNR_combss100.rds"
+)
+final_results_file <- file.path(
+  output_dir,
+  "final_results_populationSNR_combss100.rds"
+)
+cat(
+  "\nExperiment 5.2.1 - Effect of True Model Size\n"
+)
+cat(
+  "n =",
+  n,
+  "\n"
+)
+cat(
+  "p =",
+  p,
+  "\n"
+)
+cat(
+  "rho =",
+  rho,
+  "\n"
+)
+cat(
+  "Target population SNR =",
+  target_snr,
+  "\n"
+)
+cat(
+  "True model sizes =",
+  paste(
+    true_sizes,
+    collapse = ", "
+  ),
+  "\n"
+)
+cat(
+  "Candidate model sizes =",
+  paste(
+    k_values,
+    collapse = ", "
+  ),
+  "\n"
+)
+cat(
+  "Reference size k_max =",
+  k_max,
+  "\n"
+)
+cat(
+  "Monte Carlo replications =",
+  n_rep,
+  "\n"
+)
+```
+
+```{r}
+# Section 6
+# Generate paired Monte Carlo datasets
+#
+# Population construction:
+#
+# Sigma_rho = (1-rho) I_p + rho 11'
+#
+# sigma^2 =
+# beta*' Sigma_rho beta* / target_snr
+#
+# A common design, nested support, coefficients and raw
+# N(0,1) noise direction are used across true model sizes
+# within each replication.
+generate_replication_base <- function(
+    rep_id,
+    n,
+    p,
+    rho,
+    max_s,
+    beta_min,
+    beta_max,
+    master_seed
+) {
+  set.seed(
+    master_seed +
+      rep_id
+  )
+  # Equicorrelated Gaussian predictors
+  #
+  # X_j = sqrt(rho) Z_0 + sqrt(1-rho) Z_j
+  common_factor <- rnorm(
+    n
+  )
+  Z <- matrix(
+    rnorm(
+      n * p
+    ),
+    nrow = n,
+    ncol = p
+  )
+  X_raw <-
+    sqrt(
+      rho
+    ) *
+    matrix(
+      common_factor,
+      nrow = n,
+      ncol = p
+    ) +
+    sqrt(
+      1 - rho
+    ) *
+    Z
+  # Population predictor covariance
+  Sigma_rho <-
+    (
+      1 -
+        rho
+    ) *
+    diag(
+      p
+    ) +
+    rho *
+    matrix(
+      1,
+      nrow = p,
+      ncol = p
+    )
+  # Nested true support
+  #
+  # The first s entries are active for model size s.
+  active_order <- sample(
+    seq_len(
+      p
+    ),
+    size = max_s,
+    replace = FALSE
+  )
+  # True coefficients
+  #
+  # Coefficients are also nested across true model sizes.
+  magnitudes <- runif(
+    max_s,
+    min = beta_min,
+    max = beta_max
+  )
+  signs <- sample(
+    c(
+      -1,
+      1
+    ),
+    size = max_s,
+    replace = TRUE
+  )
+  beta_values <-
+    signs *
+    magnitudes
+  # Common raw standard-normal noise direction
+  #
+  # Deliberately NOT centred or sample-standardised.
+  epsilon_base <- rnorm(
+    n
+  )
+  list(
+    X_raw =
+      X_raw,
+    Sigma_rho =
+      Sigma_rho,
+    active_order =
+      active_order,
+    beta_values =
+      beta_values,
+    epsilon_base =
+      epsilon_base
+  )
+}
+make_dataset <- function(
+    base,
+    s,
+    target_snr
+) {
+  X_raw <- base$X_raw
+  p <- ncol(
+    X_raw
+  )
+  # True support
+  true_support <- sort(
+    base$active_order[
+      seq_len(
+        s
+      )
+    ]
+  )
+  # True coefficient vector
+  beta_true <- numeric(
+    p
+  )
+  beta_true[
+    true_support
+  ] <- base$beta_values[
+    seq_len(
+      s
+    )
+  ]
+  # Population signal variance
+  #
+  # Var(x' beta*) = beta*' Sigma_rho beta*
+  population_signal_variance <- as.numeric(
+    t(
+      beta_true
+    ) %*%
+      base$Sigma_rho %*%
+      beta_true
+  )
+  # Population noise variance
+  #
+  # target_snr =
+  # beta*' Sigma_rho beta* / sigma^2
+  sigma_sq <-
+    population_signal_variance /
+    target_snr
+  sigma <- sqrt(
+    sigma_sq
+  )
+  # Generate the response using the raw population design
+  signal_raw <- as.vector(
+    X_raw %*%
+      beta_true
+  )
+  epsilon <-
+    sigma *
+    base$epsilon_base
+  y_raw <-
+    signal_raw +
+    epsilon
+  # Standardise predictors only after generating the response
+  X <- as.matrix(
+    scale(
+      X_raw,
+      center = TRUE,
+      scale = TRUE
+    )
+  )
+  colnames(
+    X
+  ) <- paste0(
+    "X",
+    seq_len(
+      p
+    )
+  )
+  # Centre response because methods use no intercept
+  y <- as.numeric(
+    y_raw -
+      mean(
+        y_raw
+      )
+  )
+  # Realised sample SNR
+  #
+  # Diagnostic only.
+  # It is not forced to equal target_snr.
+  realised_snr <-
+    var(
+      signal_raw
+    ) /
+    var(
+      epsilon
+    )
+  # Exact population-SNR check
+  population_snr_check <-
+    population_signal_variance /
+    sigma_sq
+  list(
+    X =
+      X,
+    y =
+      y,
+    X_raw =
+      X_raw,
+    y_raw =
+      y_raw,
+    beta_true =
+      beta_true,
+    true_support =
+      true_support,
+    target_snr =
+      target_snr,
+    population_signal_variance =
+      population_signal_variance,
+    sigma_sq =
+      sigma_sq,
+    sigma =
+      sigma,
+    population_snr_check =
+      population_snr_check,
+    realised_snr =
+      realised_snr
+  )
+}
+```
+
+```{r}
+# Section 7
+# Common helper functions
+ols_refit <- function(
+    X,
+    y,
+    support
+) {
+  support <- sort(
+    unique(
+      as.integer(
+        support
+      )
+    )
+  )
+  p <- ncol(
+    X
+  )
+  if (length(support) == 0) {
+    return(
+      list(
+        beta = numeric(
+          p
+        ),
+        fitted = rep(
+          0,
+          length(
+            y
+          )
+        ),
+        rss = sum(
+          y^2
+        )
+      )
+    )
+  }
+  Xs <- X[
+    ,
+    support,
+    drop = FALSE
+  ]
+  fit <- lm.fit(
+    x = Xs,
+    y = y
+  )
+  beta <- numeric(
+    p
+  )
+  beta[
+    support
+  ] <- fit$coefficients
+  fitted <- as.vector(
+    X %*%
+      beta
+  )
+  rss <- sum(
+    (
+      y -
+        fitted
+    )^2
+  )
+  list(
+    beta = beta,
+    fitted = fitted,
+    rss = rss
+  )
+}
+support_key <- function(
+    support
+) {
+  if (length(support) == 0) {
+    return("")
+  }
+  paste(
+    sort(
+      support
+    ),
+    collapse = ","
+  )
+}
+safe_model_fit <- function(
+    fit_function,
+    model_size,
+    ...
+) {
+  tryCatch(
+    {
+      ans <- fit_function(
+        ...
+      )
+      ans$success <- TRUE
+      ans$error <- NA_character_
+      ans$k <- model_size
+      ans
+    },
+    error = function(e) {
+      list(
+        success = FALSE,
+        error = conditionMessage(
+          e
+        ),
+        k = model_size,
+        support = integer(
+          0
+        ),
+        beta = numeric(
+          0
+        ),
+        fitted = numeric(
+          0
+        ),
+        rss = NA_real_,
+        runtime = NA_real_,
+        status = NA_character_,
+        mip_gap = NA_real_
+      )
+    }
+  )
+}
+```
+
+```{r}
+# Section 8
+# CPLEX, COMBSS and ABESS wrappers
+fit_cplex_model <- function(
+    X,
+    y,
+    k,
+    M
+) {
+  start_time <- proc.time()[3]
+  fit <- best_subset_cplex(
+    X = X,
+    y = y,
+    s = k,
+    M = M
+  )
+  runtime <-
+    proc.time()[3] -
+      start_time
+  support <- sort(
+    as.integer(
+      fit$selected
+    )
+  )
+  if (
+    length(
+      support
+    ) !=
+      k
+  ) {
+    stop(
+      paste(
+        "CPLEX returned",
+        length(
+          support
+        ),
+        "selected variables when k =",
+        k
+      )
+    )
+  }
+  # OLS refit on selected support
+  refit <- ols_refit(
+    X = X,
+    y = y,
+    support = support
+  )
+  list(
+    support =
+      support,
+    beta =
+      refit$beta,
+    fitted =
+      refit$fitted,
+    rss =
+      refit$rss,
+    runtime =
+      runtime,
+    status =
+      fit$status,
+    mip_gap =
+      fit$mip_gap,
+    max_abs_beta =
+      fit$max_abs_beta
+  )
+}
+fit_combss_model <- function(
+    X,
+    y,
+    k
+) {
+  start_time <- proc.time()[3]
+  fit <- combss::combss(
+    x = X,
+    y = y,
+    family = "gaussian",
+    q = k,
+    lam_ridge = 0,
+    Niter = 100,
+    alpha = 0.1,
+    scale = FALSE,
+    verbose = FALSE
+  )
+  runtime <-
+    proc.time()[3] -
+      start_time
+  if (
+    length(
+      fit$subset_list
+    ) <
+      k
+  ) {
+    stop(
+      paste(
+        "COMBSS did not return model size",
+        k
+      )
+    )
+  }
+  support <- sort(
+    as.integer(
+      fit$subset_list[[
+        k
+      ]]
+    )
+  )
+  if (
+    length(
+      support
+    ) !=
+      k
+  ) {
+    stop(
+      paste(
+        "COMBSS returned",
+        length(
+          support
+        ),
+        "predictors when k =",
+        k
+      )
+    )
+  }
+  refit <- ols_refit(
+    X = X,
+    y = y,
+    support = support
+  )
+  list(
+    support =
+      support,
+    beta =
+      refit$beta,
+    fitted =
+      refit$fitted,
+    rss =
+      refit$rss,
+    runtime =
+      runtime,
+    status =
+      NA_character_,
+    mip_gap =
+      NA_real_
+  )
+}
+fit_abess_path <- function(
+    X,
+    y,
+    k_values
+) {
+  total_start <- proc.time()[3]
+  fit <- abess::abess(
+    x = X,
+    y = y,
+    family = "gaussian",
+    tune.path = "sequence",
+    support.size = k_values,
+    tune.type = "gic",
+    lambda = 0,
+    normalize = 0,
+    fit.intercept = FALSE,
+    early.stop = FALSE,
+    warm.start = TRUE,
+    num.threads = 1
+  )
+  total_runtime <-
+    proc.time()[3] -
+      total_start
+  models <- vector(
+    mode = "list",
+    length = length(
+      k_values
+    )
+  )
+  for (
+    ii in seq_along(
+      k_values
+    )
+  ) {
+    k <- k_values[ii]
+    model <- abess::extract(
+      fit,
+      support.size = k
+    )
+    beta_hat <- as.numeric(
+      model$beta
+    )
+    support <- sort(
+      which(
+        abs(
+          beta_hat
+        ) >
+          1e-10
+      )
+    )
+    if (
+      length(
+        support
+      ) !=
+        k
+    ) {
+      stop(
+        paste(
+          "ABESS returned",
+          length(
+            support
+          ),
+          "predictors when k =",
+          k
+        )
+      )
+    }
+    refit <- ols_refit(
+      X = X,
+      y = y,
+      support = support
+    )
+    models[[
+      ii
+    ]] <- list(
+      success =
+        TRUE,
+      error =
+        NA_character_,
+      k =
+        k,
+      support =
+        support,
+      beta =
+        refit$beta,
+      fitted =
+        refit$fitted,
+      rss =
+        refit$rss,
+      runtime =
+        NA_real_,
+      status =
+        NA_character_,
+      mip_gap =
+        NA_real_
+    )
+  }
+  # ABESS native GIC estimate
+  best_model <- abess::extract(
+    fit
+  )
+  gic_size <- as.integer(
+    best_model$support.size
+  )
+  list(
+    success =
+      TRUE,
+    models =
+      models,
+    path_runtime =
+      total_runtime,
+    gic_size =
+      gic_size,
+    fit =
+      fit,
+    error =
+      NA_character_
+  )
+}
+```
+
+```{r}
+# Section 9
+# L0Learn dense and adaptively refined path
+fit_l0learn_path <- function(
+    X,
+    y,
+    max_support,
+    grid_points = 1200,
+    upper_multiplier = 2,
+    lower_multiplier = 0.02,
+    refine_points_per_gap = 100,
+    refine_rounds = 2
+) {
+  total_start <- proc.time()[3]
+  max_support <- min(
+    max_support,
+    ncol(
+      X
+    )
+  )
+  # STEP 1
+  # Pilot path
+  pilot_fit <- L0Learn::L0Learn.fit(
+    x = X,
+    y = y,
+    loss = "SquaredError",
+    penalty = "L0",
+    algorithm = "CD",
+    maxSuppSize = max_support,
+    nLambda = 100,
+    scaleDownFactor = 0.80,
+    screenSize = ncol(X),
+    intercept = FALSE
+  )
+  pilot_lambda <- as.numeric(
+    pilot_fit$lambda[[
+      1
+    ]]
+  )
+  pilot_lambda <- pilot_lambda[
+    is.finite(
+      pilot_lambda
+    ) &
+      pilot_lambda >
+        0
+  ]
+  if (length(pilot_lambda) < 2) {
+    stop(
+      "L0Learn pilot path did not produce a usable lambda range."
+    )
+  }
+  lambda_upper <-
+    max(
+      pilot_lambda
+    ) *
+      upper_multiplier
+  lambda_lower <-
+    min(
+      pilot_lambda
+    ) *
+      lower_multiplier
+  # STEP 2
+  # Dense lambda grid
+  lambda_grid <- exp(
+    seq(
+      from = log(
+        lambda_upper
+      ),
+      to = log(
+        lambda_lower
+      ),
+      length.out = grid_points
+    )
+  )
+  run_cdpsi <- function(
+      lambda_values
+  ) {
+    L0Learn::L0Learn.fit(
+      x = X,
+      y = y,
+      loss = "SquaredError",
+      penalty = "L0",
+      algorithm = "CDPSI",
+      maxSuppSize = max_support,
+      lambdaGrid = list(
+        lambda_values
+      ),
+      partialSort = TRUE,
+      maxIters = 200,
+      rtol = 1e-6,
+      atol = 1e-9,
+      activeSet = TRUE,
+      activeSetNum = 3,
+      maxSwaps = 100,
+      screenSize = ncol(X),
+      intercept = FALSE
+    )
+  }
+  # STEP 3
+  # Initial dense path
+  fit <- run_cdpsi(
+    lambda_grid
+  )
+  refinement_rounds_used <- 0
+  # STEP 4
+  # Refine support-size jumps
+  if (refine_rounds > 0) {
+    for (
+      rr in seq_len(
+        refine_rounds
+      )
+    ) {
+      fitted_lambda <- as.numeric(
+        fit$lambda[[
+          1
+        ]]
+      )
+      support_sizes <- as.integer(
+        fit$suppSize[[
+          1
+        ]]
+      )
+      ord <- order(
+        fitted_lambda,
+        decreasing = TRUE
+      )
+      lambda_ordered <-
+        fitted_lambda[
+          ord
+        ]
+      size_ordered <-
+        support_sizes[
+          ord
+        ]
+      gap_indices <- which(
+        abs(
+          diff(
+            size_ordered
+          )
+        ) >
+          1
+      )
+      if (length(gap_indices) == 0) {
+        break
+      }
+      extra_lambda <- numeric(
+        0
+      )
+      for (i in gap_indices) {
+        upper <- max(
+          lambda_ordered[i],
+          lambda_ordered[
+            i + 1
+          ]
+        )
+        lower <- min(
+          lambda_ordered[i],
+          lambda_ordered[
+            i + 1
+          ]
+        )
+        if (
+          is.finite(
+            upper
+          ) &&
+            is.finite(
+              lower
+            ) &&
+            lower > 0 &&
+            upper > lower
+        ) {
+          local_grid <- exp(
+            seq(
+              from = log(
+                upper
+              ),
+              to = log(
+                lower
+              ),
+              length.out =
+                refine_points_per_gap +
+                2
+            )
+          )
+          local_grid <- local_grid[
+            -c(
+              1,
+              length(
+                local_grid
+              )
+            )
+          ]
+          extra_lambda <- c(
+            extra_lambda,
+            local_grid
+          )
+        }
+      }
+      if (length(extra_lambda) == 0) {
+        break
+      }
+      new_lambda_grid <- sort(
+        unique(
+          c(
+            lambda_grid,
+            extra_lambda
+          )
+        ),
+        decreasing = TRUE
+      )
+      if (
+        length(
+          new_lambda_grid
+        ) ==
+          length(
+            lambda_grid
+          )
+      ) {
+        break
+      }
+      lambda_grid <-
+        new_lambda_grid
+      refinement_rounds_used <-
+        rr
+      fit <- run_cdpsi(
+        lambda_grid
+      )
+    }
+  }
+  # STEP 5
+  # Extract only cardinalities that actually occur
+  support_sizes <- as.integer(
+    fit$suppSize[[
+      1
+    ]]
+  )
+  fitted_lambda <- as.numeric(
+    fit$lambda[[
+      1
+    ]]
+  )
+  beta_path <- as.matrix(
+    fit$beta[[
+      1
+    ]]
+  )
+  candidate_sizes <- sort(
+    unique(
+      support_sizes[
+        support_sizes >= 1 &
+          support_sizes <=
+            max_support
+      ]
+    )
+  )
+  models <- list()
+  model_counter <- 1
+  for (k in candidate_sizes) {
+    candidate_indices <- which(
+      support_sizes ==
+        k
+    )
+    valid_supports <- list()
+    valid_refits <- list()
+    valid_lambda <- numeric(
+      0
+    )
+    valid_rss <- numeric(
+      0
+    )
+    valid_counter <- 1
+    for (index in candidate_indices) {
+      beta_j <- beta_path[
+        ,
+        index
+      ]
+      support_j <- sort(
+        which(
+          abs(
+            beta_j
+          ) >
+            1e-10
+        )
+      )
+      if (
+        length(
+          support_j
+        ) !=
+          k
+      ) {
+        next
+      }
+      refit_j <- ols_refit(
+        X = X,
+        y = y,
+        support = support_j
+      )
+      valid_supports[[
+        valid_counter
+      ]] <- support_j
+      valid_refits[[
+        valid_counter
+      ]] <- refit_j
+      valid_lambda[
+        valid_counter
+      ] <- fitted_lambda[
+        index
+      ]
+      valid_rss[
+        valid_counter
+      ] <- refit_j$rss
+      valid_counter <-
+        valid_counter +
+          1
+    }
+    if (length(valid_rss) == 0) {
+      next
+    }
+    # At fixed cardinality the L0 penalty is constant.
+    # Retain the observed solution with minimum OLS RSS.
+    best_candidate <- which.min(
+      valid_rss
+    )
+    best_refit <- valid_refits[[
+      best_candidate
+    ]]
+    models[[
+      model_counter
+    ]] <- list(
+      success = TRUE,
+      error = NA_character_,
+      k = k,
+      support =
+        valid_supports[[
+          best_candidate
+        ]],
+      beta =
+        best_refit$beta,
+      fitted =
+        best_refit$fitted,
+      rss =
+        best_refit$rss,
+      selected_lambda =
+        valid_lambda[
+          best_candidate
+        ],
+      runtime = NA_real_,
+      status = NA_character_,
+      mip_gap = NA_real_
+    )
+    model_counter <-
+      model_counter +
+        1
+  }
+  if (length(models) == 0) {
+    stop(
+      "L0Learn produced no usable positive-cardinality models."
+    )
+  }
+  model_sizes <- vapply(
+    models,
+    function(x) {
+      x$k
+    },
+    integer(
+      1
+    )
+  )
+  ord <- order(
+    model_sizes
+  )
+  models <- models[
+    ord
+  ]
+  available_sizes <- sort(
+    vapply(
+      models,
+      function(x) {
+        x$k
+      },
+      integer(
+        1
+      )
+    )
+  )
+  total_runtime <-
+    proc.time()[3] -
+      total_start
+  list(
+    success = TRUE,
+    models = models,
+    path_runtime =
+      total_runtime,
+    available_sizes =
+      available_sizes,
+    missing_sizes =
+      setdiff(
+        seq_len(
+          max_support
+        ),
+        available_sizes
+      ),
+    number_distinct_sizes =
+      length(
+        available_sizes
+      ),
+    refinement_rounds =
+      refinement_rounds_used,
+    number_lambda_values =
+      length(
+        fitted_lambda
+      ),
+    fit = fit,
+    error = NA_character_
+  )
+}
+```
+
+```{r}
+# Section 10
+# Construct complete CPLEX and COMBSS fixed-size paths
+fit_fixed_path <- function(
+    method,
+    X,
+    y,
+    k_values
+) {
+  models <- vector(
+    mode = "list",
+    length = length(
+      k_values
+    )
+  )
+  for (
+    ii in seq_along(
+      k_values
+    )
+  ) {
+    k <- k_values[ii]
+    cat(
+      "      ",
+      method,
+      " k = ",
+      k,
+      "\n",
+      sep = ""
+    )
+    if (method == "CPLEX") {
+      model <- safe_model_fit(
+        fit_cplex_model,
+        model_size = k,
+        X = X,
+        y = y,
+        k = k,
+        M = big_M
+      )
+    } else if (method == "COMBSS") {
+      model <- safe_model_fit(
+        fit_combss_model,
+        model_size = k,
+        X = X,
+        y = y,
+        k = k
+      )
+    } else {
+      stop(
+        "Unknown fixed-path method."
+      )
+    }
+    models[[
+      ii
+    ]] <-
+      model
+  }
+  successful <- vapply(
+    models,
+    function(x) {
+      isTRUE(
+        x$success
+      )
+    },
+    logical(
+      1
+    )
+  )
+  runtimes <- vapply(
+    models,
+    function(x) {
+      if (
+        is.null(
+          x$runtime
+        )
+      ) {
+        return(
+          NA_real_
+        )
+      }
+      x$runtime
+    },
+    numeric(
+      1
+    )
+  )
+  path_runtime <-
+    if (
+      all(
+        is.na(
+          runtimes
+        )
+      )
+    ) {
+      NA_real_
+    } else {
+      sum(
+        runtimes,
+        na.rm = TRUE
+      )
+    }
+  list(
+    success =
+      all(
+        successful
+      ),
+    models =
+      models,
+    path_runtime =
+      path_runtime,
+    error =
+      if (
+        all(
+          successful
+        )
+      ) {
+        NA_character_
+      } else {
+        "At least one fixed-size model failed."
+      }
+  )
+}
+```
+
+```{r}
+# Section 11
+# Piecewise-linear breakpoint estimator
+fit_linear_segment <- function(
+    x,
+    y
+) {
+  design <- cbind(
+    1,
+    x
+  )
+  fit <- lm.fit(
+    x = design,
+    y = y
+  )
+  coefficients <- fit$coefficients
+  fitted <- as.vector(
+    design %*%
+      coefficients
+  )
+  residuals <-
+    y -
+      fitted
+  list(
+    intercept =
+      coefficients[1],
+    slope =
+      coefficients[2],
+    fitted =
+      fitted,
+    sse =
+      sum(
+        residuals^2
+      )
+  )
+}
+piecewise_breakpoint <- function(
+    k,
+    z,
+    min_left = 2,
+    min_right = 2
+) {
+  valid <-
+    is.finite(
+      k
+    ) &
+    is.finite(
+      z
+    )
+  k <- k[
+    valid
+  ]
+  z <- z[
+    valid
+  ]
+  ord <- order(
+    k
+  )
+  k <- k[
+    ord
+  ]
+  z <- z[
+    ord
+  ]
+  m <- length(
+    k
+  )
+  if (
+    m <
+      min_left +
+      min_right
+  ) {
+    return(
+      list(
+        success = FALSE,
+        breakpoint_after_k =
+          NA_integer_,
+        s_hat =
+          NA_integer_,
+        total_sse =
+          NA_real_,
+        fitted =
+          rep(
+            NA_real_,
+            m
+          ),
+        segment =
+          rep(
+            NA_character_,
+            m
+          )
+      )
+    )
+  }
+  candidate_indices <- seq(
+    from =
+      min_left,
+    to =
+      m -
+      min_right
+  )
+  total_sse <- rep(
+    NA_real_,
+    length(
+      candidate_indices
+    )
+  )
+  for (
+    ii in seq_along(
+      candidate_indices
+    )
+  ) {
+    split_index <-
+      candidate_indices[
+        ii
+      ]
+    left_index <- seq_len(
+      split_index
+    )
+    right_index <- seq(
+      split_index + 1,
+      m
+    )
+    left_fit <- fit_linear_segment(
+      x =
+        k[
+          left_index
+        ],
+      y =
+        z[
+          left_index
+        ]
+    )
+    right_fit <- fit_linear_segment(
+      x =
+        k[
+          right_index
+        ],
+      y =
+        z[
+          right_index
+        ]
+    )
+    total_sse[ii] <-
+      left_fit$sse +
+      right_fit$sse
+  }
+  best_candidate <- which.min(
+    total_sse
+  )
+  split_index <-
+    candidate_indices[
+      best_candidate
+    ]
+  left_index <- seq_len(
+    split_index
+  )
+  right_index <- seq(
+    split_index + 1,
+    m
+  )
+  left_fit <- fit_linear_segment(
+    x =
+      k[
+        left_index
+      ],
+    y =
+      z[
+        left_index
+      ]
+  )
+  right_fit <- fit_linear_segment(
+    x =
+      k[
+        right_index
+      ],
+    y =
+      z[
+        right_index
+      ]
+  )
+  fitted_piecewise <- rep(
+    NA_real_,
+    m
+  )
+  fitted_piecewise[
+    left_index
+  ] <- left_fit$fitted
+  fitted_piecewise[
+    right_index
+  ] <- right_fit$fitted
+  segment <- rep(
+    NA_character_,
+    m
+  )
+  segment[
+    left_index
+  ] <- "Left"
+  segment[
+    right_index
+  ] <- "Right"
+  breakpoint_after_k <-
+    k[
+      split_index
+    ]
+  # Thesis definition:
+  #
+  # s_hat = b_hat + 1
+  s_hat <-
+    breakpoint_after_k +
+      1L
+  list(
+    success = TRUE,
+    breakpoint_after_k =
+      as.integer(
+        breakpoint_after_k
+      ),
+    s_hat =
+      as.integer(
+        s_hat
+      ),
+    total_sse =
+      total_sse[
+        best_candidate
+      ],
+    fitted =
+      fitted_piecewise,
+    segment =
+      segment,
+    left_intercept =
+      left_fit$intercept,
+    left_slope =
+      left_fit$slope,
+    right_intercept =
+      right_fit$intercept,
+    right_slope =
+      right_fit$slope
+  )
+}
+```
+
+```{r}
+# Section 12
+# Threshold and breakpoint model-size identification
+diagnose_model_path <- function(
+    path,
+    n,
+    p,
+    required_reference_k,
+    required_k_values = NULL,
+    require_complete_path = FALSE,
+    ratio_floor = 1e-16,
+    min_left = 2,
+    min_right = 2
+) {
+  # Helper for failed diagnostic paths
+  failure <- function(
+      reason
+  ) {
+    list(
+      threshold_available =
+        FALSE,
+      threshold_hat =
+        NA_integer_,
+      piecewise_available =
+        FALSE,
+      piecewise_hat =
+        NA_integer_,
+      breakpoint_after_k =
+        NA_integer_,
+      reference_k =
+        NA_integer_,
+      sigma_hat_sq =
+        NA_real_,
+      curve =
+        NULL,
+      failure_reason =
+        reason
+    )
+  }
+  # Basic path check
+  if (
+    is.null(
+      path$models
+    ) ||
+    length(
+      path$models
+    ) ==
+      0
+  ) {
+    return(
+      failure(
+        "No fitted model path was available."
+      )
+    )
+  }
+  # Keep successful fitted models
+  valid_model <- vapply(
+    path$models,
+    function(x) {
+      isTRUE(
+        x$success
+      ) &&
+        is.finite(
+          x$rss
+        ) &&
+        length(
+          x$fitted
+        ) ==
+          n
+    },
+    logical(
+      1
+    )
+  )
+  models <- path$models[
+    valid_model
+  ]
+  if (
+    length(
+      models
+    ) ==
+      0
+  ) {
+    return(
+      failure(
+        "No successful fitted models were available."
+      )
+    )
+  }
+  model_k <- vapply(
+    models,
+    function(x) {
+      as.integer(
+        x$k
+      )
+    },
+    integer(
+      1
+    )
+  )
+  ord <- order(
+    model_k
+  )
+  models <- models[
+    ord
+  ]
+  model_k <- model_k[
+    ord
+  ]
+  # CPLEX, COMBSS and ABESS require the complete path.
+  #
+  # L0Learn is allowed to skip cardinalities.
+  if (
+    require_complete_path
+  ) {
+    missing_required <- setdiff(
+      required_k_values,
+      model_k
+    )
+    if (
+      length(
+        missing_required
+      ) >
+        0
+    ) {
+      return(
+        failure(
+          paste(
+            "Complete path unavailable. Missing k:",
+            paste(
+              missing_required,
+              collapse = ", "
+            )
+          )
+        )
+      )
+    }
+  }
+  # k_max must be available.
+  reference_match <- which(
+    model_k ==
+      required_reference_k
+  )
+  if (
+    length(
+      reference_match
+    ) !=
+      1
+  ) {
+    return(
+      failure(
+        paste(
+          "Reference model k =",
+          required_reference_k,
+          "was not available."
+        )
+      )
+    )
+  }
+  keep <-
+    model_k <=
+      required_reference_k
+  models <- models[
+    keep
+  ]
+  model_k <- model_k[
+    keep
+  ]
+  reference_index <- which(
+    model_k ==
+      required_reference_k
+  )
+  reference_model <- models[[
+    reference_index
+  ]]
+  reference_k <-
+    required_reference_k
+  fitted_reference <-
+    reference_model$fitted
+  rss_reference <-
+    reference_model$rss
+  # Noise variance estimate
+  #
+  # sigma_hat^2 = RSS(k_max)/(n-k_max)
+  sigma_hat_sq <-
+    rss_reference /
+    (
+      n -
+        reference_k
+    )
+  if (
+    !is.finite(
+      sigma_hat_sq
+    ) ||
+    sigma_hat_sq <=
+      0
+  ) {
+    return(
+      failure(
+        "Reference-model variance estimate was invalid."
+      )
+    )
+  }
+  # Calculate Score(k), Level(k) and R(k)
+  score <- rep(
+    NA_real_,
+    length(
+      models
+    )
+  )
+  level <- rep(
+    NA_real_,
+    length(
+      models
+    )
+  )
+  ratio <- rep(
+    NA_real_,
+    length(
+      models
+    )
+  )
+  for (
+    ii in seq_along(
+      models
+    )
+  ) {
+    model <- models[[
+      ii
+    ]]
+    k_i <- model$k
+    # Score(k)
+    score[ii] <- sum(
+      (
+        model$fitted -
+          fitted_reference
+      )^2
+    )
+    # Level(k)
+    level[ii] <-
+      4 *
+      (
+        sqrt(
+          k_i
+        ) +
+          sqrt(
+            reference_k
+          )
+      )^2 *
+      (
+        2 *
+          log(
+            p
+          ) +
+          log(
+            n
+          ) +
+          1
+      ) *
+      sigma_hat_sq
+    # R(k)
+    ratio[ii] <-
+      score[ii] /
+      level[ii]
+  }
+  curve <- data.frame(
+    k =
+      model_k,
+    score =
+      score,
+    level =
+      level,
+    ratio =
+      ratio,
+    is_reference =
+      model_k ==
+      reference_k,
+    used_in_piecewise =
+      model_k <
+      reference_k,
+    log10_ratio =
+      NA_real_,
+    piecewise_fit =
+      NA_real_,
+    piecewise_segment =
+      NA_character_,
+    stringsAsFactors =
+      FALSE
+  )
+  # THRESHOLD ESTIMATOR
+  #
+  # s_hat = min{k < k_max : R(k) <= 1}
+  #
+  # k_max is excluded because R(k_max) = 0 by construction.
+  #
+  # If no earlier crossing occurs, the threshold estimate is
+  # recorded as unavailable.
+  qualifying <- curve$k[
+    is.finite(
+      curve$ratio
+    ) &
+      curve$k <
+      reference_k &
+      curve$ratio <=
+      1
+  ]
+  threshold_hat <-
+    if (
+      length(
+        qualifying
+      ) >
+        0
+    ) {
+      min(
+        qualifying
+      )
+    } else {
+      NA_integer_
+    }
+  threshold_available <-
+    !is.na(
+      threshold_hat
+    )
+  # PIECEWISE BREAKPOINT ESTIMATOR
+  #
+  # k_max is excluded because R(k_max) = 0.
+  #
+  # z_k = log10 R(k)
+  piecewise_indices <- which(
+    curve$k <
+      reference_k
+  )
+  piecewise_k <- curve$k[
+    piecewise_indices
+  ]
+  piecewise_ratio <- curve$ratio[
+    piecewise_indices
+  ]
+  piecewise_z <- log10(
+    pmax(
+      piecewise_ratio,
+      ratio_floor
+    )
+  )
+  curve$log10_ratio[
+    piecewise_indices
+  ] <- piecewise_z
+  breakpoint <- piecewise_breakpoint(
+    k =
+      piecewise_k,
+    z =
+      piecewise_z,
+    min_left =
+      min_left,
+    min_right =
+      min_right
+  )
+  piecewise_available <-
+    isTRUE(
+      breakpoint$success
+    )
+  piecewise_hat <-
+    if (
+      piecewise_available
+    ) {
+      breakpoint$s_hat
+    } else {
+      NA_integer_
+    }
+  breakpoint_after_k <-
+    if (
+      piecewise_available
+    ) {
+      breakpoint$breakpoint_after_k
+    } else {
+      NA_integer_
+    }
+  if (
+    piecewise_available
+  ) {
+    curve$piecewise_fit[
+      piecewise_indices
+    ] <- breakpoint$fitted
+    curve$piecewise_segment[
+      piecewise_indices
+    ] <- breakpoint$segment
+  }
+  list(
+    threshold_available =
+      threshold_available,
+    threshold_hat =
+      threshold_hat,
+    piecewise_available =
+      piecewise_available,
+    piecewise_hat =
+      piecewise_hat,
+    breakpoint_after_k =
+      breakpoint_after_k,
+    breakpoint_sse =
+      if (
+        piecewise_available
+      ) {
+        breakpoint$total_sse
+      } else {
+        NA_real_
+      },
+    left_intercept =
+      if (
+        piecewise_available
+      ) {
+        breakpoint$left_intercept
+      } else {
+        NA_real_
+      },
+    left_slope =
+      if (
+        piecewise_available
+      ) {
+        breakpoint$left_slope
+      } else {
+        NA_real_
+      },
+    right_intercept =
+      if (
+        piecewise_available
+      ) {
+        breakpoint$right_intercept
+      } else {
+        NA_real_
+      },
+    right_slope =
+      if (
+        piecewise_available
+      ) {
+        breakpoint$right_slope
+      } else {
+        NA_real_
+      },
+    reference_k =
+      reference_k,
+    sigma_hat_sq =
+      sigma_hat_sq,
+    curve =
+      curve,
+    failure_reason =
+      NA_character_
+  )
+}
+```
+
+```{r}
+# Section 13
+# Result table helper functions
+path_to_table <- function(
+    path,
+    rep_id,
+    s_true,
+    method
+) {
+  if (
+    is.null(
+      path$models
+    ) ||
+    length(
+      path$models
+    ) ==
+      0
+  ) {
+    return(
+      data.frame()
+    )
+  }
+  rows <- vector(
+    mode = "list",
+    length = length(
+      path$models
+    )
+  )
+  for (
+    ii in seq_along(
+      path$models
+    )
+  ) {
+    model <- path$models[[
+      ii
+    ]]
+    rows[[
+      ii
+    ]] <- data.frame(
+      rep =
+        rep_id,
+      s_true =
+        s_true,
+      method =
+        method,
+      k =
+        model$k,
+      success =
+        isTRUE(
+          model$success
+        ),
+      support =
+        if (
+          isTRUE(
+            model$success
+          )
+        ) {
+          support_key(
+            model$support
+          )
+        } else {
+          NA_character_
+        },
+      rss =
+        model$rss,
+      runtime =
+        model$runtime,
+      path_runtime =
+        path$path_runtime,
+      cplex_status =
+        if (
+          is.null(
+            model$status
+          )
+        ) {
+          NA_character_
+        } else {
+          model$status
+        },
+      cplex_gap =
+        if (
+          is.null(
+            model$mip_gap
+          )
+        ) {
+          NA_real_
+        } else {
+          model$mip_gap
+        },
+      error =
+        if (
+          is.null(
+            model$error
+          )
+        ) {
+          NA_character_
+        } else {
+          model$error
+        },
+      stringsAsFactors =
+        FALSE
+    )
+  }
+  bind_rows(
+    rows
+  )
+}
+make_identification_row <- function(
+    rep_id,
+    s_true,
+    method,
+    estimator,
+    s_hat,
+    path_runtime = NA_real_,
+    reference_k = NA_integer_,
+    failure_reason = NA_character_
+) {
+  estimate_available <-
+    !is.na(
+      s_hat
+    )
+  data.frame(
+    rep =
+      rep_id,
+    s_true =
+      s_true,
+    method =
+      method,
+    estimator =
+      estimator,
+    s_hat =
+      if (
+        estimate_available
+      ) {
+        as.integer(
+          s_hat
+        )
+      } else {
+        NA_integer_
+      },
+    estimate_available =
+      estimate_available,
+    correct =
+      if (
+        estimate_available
+      ) {
+        s_hat ==
+        s_true
+      } else {
+        FALSE
+      },
+    absolute_error =
+      if (
+        estimate_available
+      ) {
+        abs(
+          s_hat -
+          s_true
+        )
+      } else {
+        NA_real_
+      },
+    signed_error =
+      if (
+        estimate_available
+      ) {
+        s_hat -
+        s_true
+      } else {
+        NA_real_
+      },
+    reference_k =
+      reference_k,
+    path_runtime =
+      path_runtime,
+    failure_reason =
+      failure_reason,
+    stringsAsFactors =
+      FALSE
+  )
+}
+diagnostic_identification_rows <- function(
+    diagnostic,
+    rep_id,
+    s_true,
+    method,
+    path_runtime
+) {
+  threshold_reason <-
+    if (
+      diagnostic$threshold_available
+    ) {
+      NA_character_
+    } else {
+      diagnostic$failure_reason
+    }
+  piecewise_reason <-
+    if (
+      diagnostic$piecewise_available
+    ) {
+      NA_character_
+    } else {
+      diagnostic$failure_reason
+    }
+  bind_rows(
+    make_identification_row(
+      rep_id =
+        rep_id,
+      s_true =
+        s_true,
+      method =
+        method,
+      estimator =
+        "Threshold",
+      s_hat =
+        diagnostic$threshold_hat,
+      path_runtime =
+        path_runtime,
+      reference_k =
+        diagnostic$reference_k,
+      failure_reason =
+        threshold_reason
+    ),
+    make_identification_row(
+      rep_id =
+        rep_id,
+      s_true =
+        s_true,
+      method =
+        method,
+      estimator =
+        "Breakpoint",
+      s_hat =
+        diagnostic$piecewise_hat,
+      path_runtime =
+        path_runtime,
+      reference_k =
+        diagnostic$reference_k,
+      failure_reason =
+        piecewise_reason
+    )
+  )
+}
+diagnostic_curve_table <- function(
+    diagnostic,
+    rep_id,
+    s_true,
+    method
+) {
+  if (
+    is.null(
+      diagnostic$curve
+    )
+  ) {
+    return(
+      data.frame()
+    )
+  }
+  diagnostic$curve %>%
+    mutate(
+      rep =
+        rep_id,
+      s_true =
+        s_true,
+      method =
+        method,
+      threshold_hat =
+        diagnostic$threshold_hat,
+      piecewise_hat =
+        diagnostic$piecewise_hat,
+      breakpoint_after_k =
+        diagnostic$breakpoint_after_k,
+      reference_k =
+        diagnostic$reference_k
+    ) %>%
+    select(
+      rep,
+      s_true,
+      method,
+      k,
+      score,
+      level,
+      ratio,
+      log10_ratio,
+      is_reference,
+      used_in_piecewise,
+      piecewise_fit,
+      piecewise_segment,
+      threshold_hat,
+      piecewise_hat,
+      breakpoint_after_k,
+      reference_k
+    )
+}
+```
+
+```{r}
+# Section 14
+# Optional one-dataset sanity check
+#
+# Set eval=TRUE to run this before launching all replications.
+test_base <- generate_replication_base(
+  rep_id =
+    1,
+  n =
+    n,
+  p =
+    p,
+  rho =
+    rho,
+  max_s =
+    max_true_size,
+  beta_min =
+    beta_min,
+  beta_max =
+    beta_max,
+  master_seed =
+    master_seed
+)
+test_data <- make_dataset(
+  base =
+    test_base,
+  s =
+    4,
+  target_snr =
+    target_snr
+)
+# Data-generating process checks
+cat(
+  "True support:",
+  paste(
+    test_data$true_support,
+    collapse = ", "
+  ),
+  "\n\n"
+)
+cat(
+  "Target population SNR:",
+  test_data$target_snr,
+  "\n"
+)
+cat(
+  "Population signal variance:",
+  round(
+    test_data$population_signal_variance,
+    6
+  ),
+  "\n"
+)
+cat(
+  "Population sigma^2:",
+  round(
+    test_data$sigma_sq,
+    6
+  ),
+  "\n"
+)
+cat(
+  "Population sigma:",
+  round(
+    test_data$sigma,
+    6
+  ),
+  "\n"
+)
+cat(
+  "Population SNR check:",
+  round(
+    test_data$population_snr_check,
+    8
+  ),
+  "\n"
+)
+cat(
+  "Realised sample SNR:",
+  round(
+    test_data$realised_snr,
+    6
+  ),
+  "\n\n"
+)
+# CPLEX
+test_cplex_path <- fit_fixed_path(
+  method =
+    "CPLEX",
+  X =
+    test_data$X,
+  y =
+    test_data$y,
+  k_values =
+    k_values
+)
+test_cplex_diag <- diagnose_model_path(
+  path =
+    test_cplex_path,
+  n =
+    n,
+  p =
+    p,
+  required_reference_k =
+    k_max,
+  required_k_values =
+    k_values,
+  require_complete_path =
+    TRUE,
+  ratio_floor =
+    ratio_floor,
+  min_left =
+    min_left_points,
+  min_right =
+    min_right_points
+)
+print(
+  test_cplex_diag$curve
+)
+cat(
+  "CPLEX threshold estimate:",
+  test_cplex_diag$threshold_hat,
+  "\n"
+)
+cat(
+  "CPLEX breakpoint estimate:",
+  test_cplex_diag$piecewise_hat,
+  "\n\n"
+)
+# COMBSS
+test_combss_path <- fit_fixed_path(
+  method =
+    "COMBSS",
+  X =
+    test_data$X,
+  y =
+    test_data$y,
+  k_values =
+    k_values
+)
+test_combss_diag <- diagnose_model_path(
+  path =
+    test_combss_path,
+  n =
+    n,
+  p =
+    p,
+  required_reference_k =
+    k_max,
+  required_k_values =
+    k_values,
+  require_complete_path =
+    TRUE,
+  ratio_floor =
+    ratio_floor,
+  min_left =
+    min_left_points,
+  min_right =
+    min_right_points
+)
+cat(
+  "COMBSS threshold estimate:",
+  test_combss_diag$threshold_hat,
+  "\n"
+)
+cat(
+  "COMBSS breakpoint estimate:",
+  test_combss_diag$piecewise_hat,
+  "\n\n"
+)
+# ABESS
+test_abess_path <- fit_abess_path(
+  X =
+    test_data$X,
+  y =
+    test_data$y,
+  k_values =
+    k_values
+)
+test_abess_diag <- diagnose_model_path(
+  path =
+    test_abess_path,
+  n =
+    n,
+  p =
+    p,
+  required_reference_k =
+    k_max,
+  required_k_values =
+    k_values,
+  require_complete_path =
+    TRUE,
+  ratio_floor =
+    ratio_floor,
+  min_left =
+    min_left_points,
+  min_right =
+    min_right_points
+)
+cat(
+  "ABESS threshold estimate:",
+  test_abess_diag$threshold_hat,
+  "\n"
+)
+cat(
+  "ABESS breakpoint estimate:",
+  test_abess_diag$piecewise_hat,
+  "\n"
+)
+cat(
+  "ABESS GIC estimate:",
+  test_abess_path$gic_size,
+  "\n\n"
+)
+# L0Learn
+test_l0_path <- fit_l0learn_path(
+  X =
+    test_data$X,
+  y =
+    test_data$y,
+  max_support =
+    l0_max_support,
+  grid_points =
+    l0_grid_points,
+  upper_multiplier =
+    l0_upper_multiplier,
+  lower_multiplier =
+    l0_lower_multiplier,
+  refine_points_per_gap =
+    l0_refine_points_per_gap,
+  refine_rounds =
+    l0_refine_rounds
+)
+test_l0_diag <- diagnose_model_path(
+  path =
+    test_l0_path,
+  n =
+    n,
+  p =
+    p,
+  required_reference_k =
+    k_max,
+  required_k_values =
+    k_values,
+  require_complete_path =
+    FALSE,
+  ratio_floor =
+    ratio_floor,
+  min_left =
+    min_left_points,
+  min_right =
+    min_right_points
+)
+cat(
+  "L0Learn observed sizes:",
+  paste(
+    test_l0_path$available_sizes,
+    collapse = ", "
+  ),
+  "\n"
+)
+cat(
+  "L0Learn threshold estimate:",
+  test_l0_diag$threshold_hat,
+  "\n"
+)
+cat(
+  "L0Learn breakpoint estimate:",
+  test_l0_diag$piecewise_hat,
+  "\n"
+)
+```
+
+```{r}
+# Section 15
+# Main Monte Carlo experiment
+# Namespace-safe diagnostic curve table
+#
+# This explicitly uses dplyr:: functions to avoid the
+# select() masking error caused by another loaded package.
+diagnostic_curve_table <- function(
+    diagnostic,
+    rep_id,
+    s_true,
+    method
+) {
+  if (
+    is.null(
+      diagnostic$curve
+    )
+  ) {
+    return(
+      data.frame()
+    )
+  }
+  diagnostic$curve %>%
+    dplyr::mutate(
+      rep =
+        rep_id,
+      s_true =
+        s_true,
+      method =
+        method,
+      threshold_hat =
+        diagnostic$threshold_hat,
+      piecewise_hat =
+        diagnostic$piecewise_hat,
+      breakpoint_after_k =
+        diagnostic$breakpoint_after_k,
+      reference_k =
+        diagnostic$reference_k
+    ) %>%
+    dplyr::select(
+      rep,
+      s_true,
+      method,
+      k,
+      score,
+      level,
+      ratio,
+      log10_ratio,
+      is_reference,
+      used_in_piecewise,
+      piecewise_fit,
+      piecewise_segment,
+      threshold_hat,
+      piecewise_hat,
+      breakpoint_after_k,
+      reference_k
+    )
+}
+# Storage objects
+identification_list <- list()
+path_results_list <- list()
+diagnostic_curve_list <- list()
+dgp_diagnostics_list <- list()
+identification_counter <- 1
+path_counter <- 1
+curve_counter <- 1
+dgp_counter <- 1
+experiment_start <- Sys.time()
+# Monte Carlo loop
+for (
+  r in seq_len(
+    n_rep
+  )
+) {
+  cat(
+    "\n============================================================\n"
+  )
+  cat(
+    "REPLICATION",
+    r,
+    "OF",
+    n_rep,
+    "\n"
+  )
+  cat(
+    "============================================================\n"
+  )
+  # Generate one common replication base
+  #
+  # The same predictor matrix, active-variable ordering,
+  # coefficient values and raw Gaussian noise direction are
+  # used across the different true model sizes.
+  base <- generate_replication_base(
+    rep_id =
+      r,
+    n =
+      n,
+    p =
+      p,
+    rho =
+      rho,
+    max_s =
+      max_true_size,
+    beta_min =
+      beta_min,
+    beta_max =
+      beta_max,
+    master_seed =
+      master_seed
+  )
+  # Loop over true model sizes
+  for (
+    s_true in true_sizes
+  ) {
+    cat(
+      "\n------------------------------------------------------------\n"
+    )
+    cat(
+      "TRUE MODEL SIZE s* =",
+      s_true,
+      "\n"
+    )
+    cat(
+      "------------------------------------------------------------\n"
+    )
+    # Construct dataset for this true model size
+    data <- make_dataset(
+      base =
+        base,
+      s =
+        s_true,
+      target_snr =
+        target_snr
+    )
+    # Save DGP diagnostics
+    dgp_diagnostics_list[[
+      dgp_counter
+    ]] <- data.frame(
+      rep =
+        r,
+      s_true =
+        s_true,
+      target_snr =
+        data$target_snr,
+      population_signal_variance =
+        data$population_signal_variance,
+      sigma_sq =
+        data$sigma_sq,
+      sigma =
+        data$sigma,
+      population_snr_check =
+        data$population_snr_check,
+      realised_snr =
+        data$realised_snr,
+      true_support =
+        paste(
+          data$true_support,
+          collapse = ","
+        ),
+      stringsAsFactors =
+        FALSE
+    )
+    dgp_counter <-
+      dgp_counter +
+        1
+    # DGP output
+    cat(
+      "True support:",
+      paste(
+        data$true_support,
+        collapse = ", "
+      ),
+      "\n"
+    )
+    cat(
+      "Population signal variance:",
+      round(
+        data$population_signal_variance,
+        6
+      ),
+      "\n"
+    )
+    cat(
+      "Population sigma^2:",
+      round(
+        data$sigma_sq,
+        6
+      ),
+      "\n"
+    )
+    cat(
+      "Population SNR check:",
+      round(
+        data$population_snr_check,
+        6
+      ),
+      "\n"
+    )
+    cat(
+      "Realised sample SNR:",
+      round(
+        data$realised_snr,
+        6
+      ),
+      "\n"
+    )
+    # CPLEX
+    cat(
+      "\n  Fitting CPLEX path...\n"
+    )
+    cplex_path <- fit_fixed_path(
+      method =
+        "CPLEX",
+      X =
+        data$X,
+      y =
+        data$y,
+      k_values =
+        k_values
+    )
+    cplex_diag <- diagnose_model_path(
+      path =
+        cplex_path,
+      n =
+        n,
+      p =
+        p,
+      required_reference_k =
+        k_max,
+      required_k_values =
+        k_values,
+      require_complete_path =
+        TRUE,
+      ratio_floor =
+        ratio_floor,
+      min_left =
+        min_left_points,
+      min_right =
+        min_right_points
+    )
+    identification_list[[
+      identification_counter
+    ]] <- diagnostic_identification_rows(
+      diagnostic =
+        cplex_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "CPLEX",
+      path_runtime =
+        cplex_path$path_runtime
+    )
+    identification_counter <-
+      identification_counter +
+        1
+    path_results_list[[
+      path_counter
+    ]] <- path_to_table(
+      path =
+        cplex_path,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "CPLEX"
+    )
+    path_counter <-
+      path_counter +
+        1
+    diagnostic_curve_list[[
+      curve_counter
+    ]] <- diagnostic_curve_table(
+      diagnostic =
+        cplex_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "CPLEX"
+    )
+    curve_counter <-
+      curve_counter +
+        1
+    # COMBSS
+    cat(
+      "\n  Fitting COMBSS path...\n"
+    )
+    combss_path <- fit_fixed_path(
+      method =
+        "COMBSS",
+      X =
+        data$X,
+      y =
+        data$y,
+      k_values =
+        k_values
+    )
+    combss_diag <- diagnose_model_path(
+      path =
+        combss_path,
+      n =
+        n,
+      p =
+        p,
+      required_reference_k =
+        k_max,
+      required_k_values =
+        k_values,
+      require_complete_path =
+        TRUE,
+      ratio_floor =
+        ratio_floor,
+      min_left =
+        min_left_points,
+      min_right =
+        min_right_points
+    )
+    identification_list[[
+      identification_counter
+    ]] <- diagnostic_identification_rows(
+      diagnostic =
+        combss_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "COMBSS",
+      path_runtime =
+        combss_path$path_runtime
+    )
+    identification_counter <-
+      identification_counter +
+        1
+    path_results_list[[
+      path_counter
+    ]] <- path_to_table(
+      path =
+        combss_path,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "COMBSS"
+    )
+    path_counter <-
+      path_counter +
+        1
+    diagnostic_curve_list[[
+      curve_counter
+    ]] <- diagnostic_curve_table(
+      diagnostic =
+        combss_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "COMBSS"
+    )
+    curve_counter <-
+      curve_counter +
+        1
+    # ABESS
+    cat(
+      "\n  Fitting ABESS path...\n"
+    )
+    abess_path <- tryCatch(
+      {
+        fit_abess_path(
+          X =
+            data$X,
+          y =
+            data$y,
+          k_values =
+            k_values
+        )
+      },
+      error = function(e) {
+        list(
+          success =
+            FALSE,
+          models =
+            NULL,
+          path_runtime =
+            NA_real_,
+          gic_size =
+            NA_integer_,
+          error =
+            conditionMessage(
+              e
+            )
+        )
+      }
+    )
+    abess_diag <- diagnose_model_path(
+      path =
+        abess_path,
+      n =
+        n,
+      p =
+        p,
+      required_reference_k =
+        k_max,
+      required_k_values =
+        k_values,
+      require_complete_path =
+        TRUE,
+      ratio_floor =
+        ratio_floor,
+      min_left =
+        min_left_points,
+      min_right =
+        min_right_points
+    )
+    identification_list[[
+      identification_counter
+    ]] <- diagnostic_identification_rows(
+      diagnostic =
+        abess_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "ABESS",
+      path_runtime =
+        abess_path$path_runtime
+    )
+    identification_counter <-
+      identification_counter +
+        1
+    # ABESS native GIC estimate
+    identification_list[[
+      identification_counter
+    ]] <- make_identification_row(
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "ABESS",
+      estimator =
+        "GIC",
+      s_hat =
+        abess_path$gic_size,
+      path_runtime =
+        abess_path$path_runtime,
+      reference_k =
+        NA_integer_,
+      failure_reason =
+        if (
+          is.na(
+            abess_path$gic_size
+          )
+        ) {
+          abess_path$error
+        } else {
+          NA_character_
+        }
+    )
+    identification_counter <-
+      identification_counter +
+        1
+    if (
+      !is.null(
+        abess_path$models
+      )
+    ) {
+      path_results_list[[
+        path_counter
+      ]] <- path_to_table(
+        path =
+          abess_path,
+        rep_id =
+          r,
+        s_true =
+          s_true,
+        method =
+          "ABESS"
+      )
+      path_counter <-
+        path_counter +
+          1
+    }
+    diagnostic_curve_list[[
+      curve_counter
+    ]] <- diagnostic_curve_table(
+      diagnostic =
+        abess_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "ABESS"
+    )
+    curve_counter <-
+      curve_counter +
+        1
+    # L0Learn
+    cat(
+      "\n  Fitting L0Learn path...\n"
+    )
+    l0_path <- tryCatch(
+      {
+        fit_l0learn_path(
+          X =
+            data$X,
+          y =
+            data$y,
+          max_support =
+            l0_max_support,
+          grid_points =
+            l0_grid_points,
+          upper_multiplier =
+            l0_upper_multiplier,
+          lower_multiplier =
+            l0_lower_multiplier,
+          refine_points_per_gap =
+            l0_refine_points_per_gap,
+          refine_rounds =
+            l0_refine_rounds
+        )
+      },
+      error = function(e) {
+        list(
+          success =
+            FALSE,
+          models =
+            NULL,
+          path_runtime =
+            NA_real_,
+          available_sizes =
+            integer(
+              0
+            ),
+          missing_sizes =
+            k_values,
+          error =
+            conditionMessage(
+              e
+            )
+        )
+      }
+    )
+    l0_diag <- diagnose_model_path(
+      path =
+        l0_path,
+      n =
+        n,
+      p =
+        p,
+      required_reference_k =
+        k_max,
+      required_k_values =
+        k_values,
+      # L0Learn is permitted to skip cardinalities.
+      require_complete_path =
+        FALSE,
+      ratio_floor =
+        ratio_floor,
+      min_left =
+        min_left_points,
+      min_right =
+        min_right_points
+    )
+    identification_list[[
+      identification_counter
+    ]] <- diagnostic_identification_rows(
+      diagnostic =
+        l0_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "L0Learn",
+      path_runtime =
+        l0_path$path_runtime
+    )
+    identification_counter <-
+      identification_counter +
+        1
+    if (
+      !is.null(
+        l0_path$models
+      )
+    ) {
+      path_results_list[[
+        path_counter
+      ]] <- path_to_table(
+        path =
+          l0_path,
+        rep_id =
+          r,
+        s_true =
+          s_true,
+        method =
+          "L0Learn"
+      )
+      path_counter <-
+        path_counter +
+          1
+    }
+    diagnostic_curve_list[[
+      curve_counter
+    ]] <- diagnostic_curve_table(
+      diagnostic =
+        l0_diag,
+      rep_id =
+        r,
+      s_true =
+        s_true,
+      method =
+        "L0Learn"
+    )
+    curve_counter <-
+      curve_counter +
+        1
+    # Progress output
+    cat(
+      "\n  Estimates:\n"
+    )
+    cat(
+      "    CPLEX:",
+      "Threshold =",
+      cplex_diag$threshold_hat,
+      "| Breakpoint =",
+      cplex_diag$piecewise_hat,
+      "\n"
+    )
+    cat(
+      "    COMBSS:",
+      "Threshold =",
+      combss_diag$threshold_hat,
+      "| Breakpoint =",
+      combss_diag$piecewise_hat,
+      "\n"
+    )
+    cat(
+      "    ABESS:",
+      "Threshold =",
+      abess_diag$threshold_hat,
+      "| Breakpoint =",
+      abess_diag$piecewise_hat,
+      "| GIC =",
+      abess_path$gic_size,
+      "\n"
+    )
+    cat(
+      "    L0Learn:",
+      "Threshold =",
+      l0_diag$threshold_hat,
+      "| Breakpoint =",
+      l0_diag$piecewise_hat,
+      "\n"
+    )
+    if (
+      !is.null(
+        l0_path$available_sizes
+      )
+    ) {
+      cat(
+        "    L0Learn available sizes:",
+        paste(
+          l0_path$available_sizes,
+          collapse = ", "
+        ),
+        "\n"
+      )
+    }
+  }
+  # Save checkpoint after each completed replication
+  checkpoint <- list(
+    completed_replication =
+      r,
+    dgp_diagnostics =
+      dplyr::bind_rows(
+        dgp_diagnostics_list
+      ),
+    identification_results =
+      dplyr::bind_rows(
+        identification_list
+      ),
+    path_results =
+      dplyr::bind_rows(
+        path_results_list
+      ),
+    diagnostic_curves =
+      dplyr::bind_rows(
+        diagnostic_curve_list
+      )
+  )
+  saveRDS(
+    checkpoint,
+    checkpoint_file
+  )
+  cat(
+    "\nCheckpoint saved after replication",
+    r,
+    "\n"
+  )
+}
+# Experiment timing
+experiment_end <- Sys.time()
+cat(
+  "\n============================================================\n"
+)
+cat(
+  "EXPERIMENT COMPLETE\n"
+)
+cat(
+  "============================================================\n"
+)
+cat(
+  "Total experiment time:",
+  as.character(
+    experiment_end -
+      experiment_start
+  ),
+  "\n"
+)
+# Create objects for following sections
+dgp_diagnostics <- dplyr::bind_rows(
+  dgp_diagnostics_list
+)
+identification_results <- dplyr::bind_rows(
+  identification_list
+)
+path_results <- dplyr::bind_rows(
+  path_results_list
+)
+diagnostic_curves <- dplyr::bind_rows(
+  diagnostic_curve_list
+)
+cat(
+  "\nDGP diagnostic rows:",
+  nrow(
+    dgp_diagnostics
+  ),
+  "\n"
+)
+cat(
+  "Identification rows:",
+  nrow(
+    identification_results
+  ),
+  "\n"
+)
+cat(
+  "Path rows:",
+  nrow(
+    path_results
+  ),
+  "\n"
+)
+cat(
+  "Diagnostic curve rows:",
+  nrow(
+    diagnostic_curves
+  ),
+  "\n"
+)
+```
+
+```{r}
+# Section 16
+# Collect and save final results
+dgp_diagnostics <- dplyr::bind_rows(
+  dgp_diagnostics_list
+)
+identification_results <- dplyr::bind_rows(
+  identification_list
+)
+path_results <- dplyr::bind_rows(
+  path_results_list
+)
+diagnostic_curves <- dplyr::bind_rows(
+  diagnostic_curve_list
+)
+final_results <- list(
+  settings = list(
+    n =
+      n,
+    p =
+      p,
+    rho =
+      rho,
+    target_snr =
+      target_snr,
+    true_sizes =
+      true_sizes,
+    k_values =
+      k_values,
+    k_max =
+      k_max,
+    n_rep =
+      n_rep,
+    beta_min =
+      beta_min,
+    beta_max =
+      beta_max,
+    big_M =
+      big_M,
+    combss_Niter =
+      100,
+    combss_alpha =
+      0.1,
+    master_seed =
+      master_seed
+  ),
+  dgp_diagnostics =
+    dgp_diagnostics,
+  identification_results =
+    identification_results,
+  path_results =
+    path_results,
+  diagnostic_curves =
+    diagnostic_curves
+)
+saveRDS(
+  final_results,
+  final_results_file
+)
+write.csv(
+  dgp_diagnostics,
+  file.path(
+    output_dir,
+    "dgp_diagnostics.csv"
+  ),
+  row.names = FALSE
+)
+write.csv(
+  identification_results,
+  file.path(
+    output_dir,
+    "identification_results.csv"
+  ),
+  row.names = FALSE
+)
+write.csv(
+  path_results,
+  file.path(
+    output_dir,
+    "path_results.csv"
+  ),
+  row.names = FALSE
+)
+write.csv(
+  diagnostic_curves,
+  file.path(
+    output_dir,
+    "diagnostic_curves.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+# Section 17
+# Model-size identification summaries
+mean_safe <- function(
+    x
+) {
+  if (
+    length(
+      x
+    ) ==
+      0 ||
+    all(
+      is.na(
+        x
+      )
+    )
+  ) {
+    return(
+      NA_real_
+    )
+  }
+  mean(
+    x,
+    na.rm = TRUE
+  )
+}
+median_safe <- function(
+    x
+) {
+  if (
+    length(
+      x
+    ) ==
+      0 ||
+    all(
+      is.na(
+        x
+      )
+    )
+  ) {
+    return(
+      NA_real_
+    )
+  }
+  median(
+    x,
+    na.rm = TRUE
+  )
+}
+# Summary by true model size, method and estimator
+model_size_summary <- identification_results %>%
+  dplyr::group_by(
+    s_true,
+    method,
+    estimator
+  ) %>%
+  dplyr::summarise(
+    replications =
+      dplyr::n(),
+    estimate_availability =
+      mean(
+        estimate_available,
+        na.rm = TRUE
+      ),
+    # Unavailable estimates count as unsuccessful because
+    # make_identification_row() records correct = FALSE when
+    # an estimate is unavailable.
+    correct_identification_rate =
+      mean(
+        correct,
+        na.rm = TRUE
+      ),
+    correct_given_available =
+      if (
+        sum(
+          estimate_available,
+          na.rm = TRUE
+        ) >
+          0
+      ) {
+        mean(
+          correct[
+            estimate_available
+          ],
+          na.rm = TRUE
+        )
+      } else {
+        NA_real_
+      },
+    MAE =
+      mean_safe(
+        absolute_error
+      ),
+    Bias =
+      mean_safe(
+        signed_error
+      ),
+    mean_estimated_size =
+      mean_safe(
+        s_hat
+      ),
+    median_estimated_size =
+      median_safe(
+        s_hat
+      ),
+    .groups =
+      "drop"
+  )
+print(
+  model_size_summary
+)
+write.csv(
+  model_size_summary,
+  file.path(
+    output_dir,
+    "model_size_summary.csv"
+  ),
+  row.names = FALSE
+)
+# Overall summary by method and estimator
+overall_summary <- identification_results %>%
+  dplyr::group_by(
+    method,
+    estimator
+  ) %>%
+  dplyr::summarise(
+    replications =
+      dplyr::n(),
+    estimate_availability =
+      mean(
+        estimate_available,
+        na.rm = TRUE
+      ),
+    correct_identification_rate =
+      mean(
+        correct,
+        na.rm = TRUE
+      ),
+    correct_given_available =
+      if (
+        sum(
+          estimate_available,
+          na.rm = TRUE
+        ) >
+          0
+      ) {
+        mean(
+          correct[
+            estimate_available
+          ],
+          na.rm = TRUE
+        )
+      } else {
+        NA_real_
+      },
+    MAE =
+      mean_safe(
+        absolute_error
+      ),
+    Bias =
+      mean_safe(
+        signed_error
+      ),
+    mean_estimated_size =
+      mean_safe(
+        s_hat
+      ),
+    median_estimated_size =
+      median_safe(
+        s_hat
+      ),
+    .groups =
+      "drop"
+  )
+print(
+  overall_summary
+)
+write.csv(
+  overall_summary,
+  file.path(
+    output_dir,
+    "overall_summary.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+# Section 18
+# CPLEX optimality and runtime diagnostics
+cplex_status_summary <- path_results %>%
+  dplyr::filter(
+    method ==
+      "CPLEX"
+  ) %>%
+  dplyr::group_by(
+    s_true,
+    k
+  ) %>%
+  dplyr::summarise(
+    fitted_runs =
+      dplyr::n(),
+    successful_runs =
+      sum(
+        success,
+        na.rm = TRUE
+      ),
+    optimal_rate =
+      if (
+        sum(
+          !is.na(
+            cplex_status
+          )
+        ) >
+          0
+      ) {
+        mean(
+          grepl(
+            "optimal",
+            cplex_status[
+              !is.na(
+                cplex_status
+              )
+            ],
+            ignore.case = TRUE
+          )
+        )
+      } else {
+        NA_real_
+      },
+    maximum_gap =
+      if (
+        all(
+          is.na(
+            cplex_gap
+          )
+        )
+      ) {
+        NA_real_
+      } else {
+        max(
+          cplex_gap,
+          na.rm = TRUE
+        )
+      },
+    median_runtime =
+      median_safe(
+        runtime
+      ),
+    .groups =
+      "drop"
+  )
+print(
+  cplex_status_summary
+)
+write.csv(
+  cplex_status_summary,
+  file.path(
+    output_dir,
+    "cplex_status_summary.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+# Section 19
+# L0Learn path coverage
+l0_path_coverage <- path_results %>%
+  dplyr::filter(
+    method ==
+      "L0Learn"
+  ) %>%
+  dplyr::group_by(
+    rep,
+    s_true
+  ) %>%
+  dplyr::summarise(
+    number_observed_sizes =
+      dplyr::n_distinct(
+        k
+      ),
+    minimum_size =
+      min(
+        k,
+        na.rm = TRUE
+      ),
+    maximum_size =
+      max(
+        k,
+        na.rm = TRUE
+      ),
+    reference_size_available =
+      any(
+        k ==
+          k_max
+      ),
+    observed_sizes =
+      paste(
+        sort(
+          unique(
+            k
+          )
+        ),
+        collapse = ","
+      ),
+    .groups =
+      "drop"
+  )
+print(
+  l0_path_coverage
+)
+l0_coverage_summary <- l0_path_coverage %>%
+  dplyr::group_by(
+    s_true
+  ) %>%
+  dplyr::summarise(
+    mean_number_sizes =
+      mean(
+        number_observed_sizes,
+        na.rm = TRUE
+      ),
+    median_number_sizes =
+      median(
+        number_observed_sizes,
+        na.rm = TRUE
+      ),
+    reference_size_availability =
+      mean(
+        reference_size_available,
+        na.rm = TRUE
+      ),
+    .groups =
+      "drop"
+  )
+print(
+  l0_coverage_summary
+)
+write.csv(
+  l0_path_coverage,
+  file.path(
+    output_dir,
+    "l0learn_path_coverage.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+# Section 20
+# Correct model-size identification rate
+correct_plot_data <- identification_results %>%
+  dplyr::group_by(
+    s_true,
+    method,
+    estimator
+  ) %>%
+  dplyr::summarise(
+    correct_rate =
+      mean(
+        correct,
+        na.rm = TRUE
+      ),
+    n =
+      dplyr::n(),
+    .groups =
+      "drop"
+  ) %>%
+  dplyr::mutate(
+    se =
+      sqrt(
+        correct_rate *
+          (
+            1 -
+              correct_rate
+          ) /
+          n
+      ),
+    lower =
+      pmax(
+        0,
+        correct_rate -
+          1.96 *
+            se
+      ),
+    upper =
+      pmin(
+        1,
+        correct_rate +
+          1.96 *
+            se
+      )
+  )
+p_correct <- ggplot2::ggplot(
+  correct_plot_data,
+  ggplot2::aes(
+    x =
+      s_true,
+    y =
+      correct_rate,
+    group =
+      estimator,
+    linetype =
+      estimator,
+    shape =
+      estimator
+  )
+) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(
+    size = 2.5
+  ) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin =
+        lower,
+      ymax =
+        upper
+    ),
+    width =
+      0.08
+  ) +
+  ggplot2::facet_wrap(
+    ~ method
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks =
+      true_sizes
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(
+      0,
+      1
+    )
+  ) +
+  ggplot2::labs(
+    x =
+      "True model size",
+    y =
+      "Correct model-size identification rate",
+    linetype =
+      "Estimator",
+    shape =
+      "Estimator"
+  ) +
+  ggplot2::theme_minimal()
+print(
+  p_correct
+)
+ggplot2::ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "model_size_recovery_rate.png"
+    ),
+  plot =
+    p_correct,
+  width =
+    10,
+  height =
+    6,
+  dpi =
+    300
+)
+```
+
+```{r}
+# Section 21
+# Model-size MAE and bias
+# Mean absolute error
+#
+# MAE is conditional on the estimator producing an estimate.
+# Availability itself is reported separately in Section 17.
+mae_plot_data <- identification_results %>%
+  dplyr::filter(
+    estimate_available
+  ) %>%
+  dplyr::group_by(
+    s_true,
+    method,
+    estimator
+  ) %>%
+  dplyr::summarise(
+    MAE =
+      mean(
+        absolute_error,
+        na.rm = TRUE
+      ),
+    .groups =
+      "drop"
+  )
+p_mae <- ggplot2::ggplot(
+  mae_plot_data,
+  ggplot2::aes(
+    x =
+      s_true,
+    y =
+      MAE,
+    group =
+      estimator,
+    linetype =
+      estimator,
+    shape =
+      estimator
+  )
+) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(
+    size = 2.5
+  ) +
+  ggplot2::facet_wrap(
+    ~ method
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks =
+      true_sizes
+  ) +
+  ggplot2::labs(
+    x =
+      "True model size",
+    y =
+      "Mean absolute model-size error",
+    linetype =
+      "Estimator",
+    shape =
+      "Estimator"
+  ) +
+  ggplot2::theme_minimal()
+print(
+  p_mae
+)
+ggplot2::ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "model_size_mae.png"
+    ),
+  plot =
+    p_mae,
+  width =
+    10,
+  height =
+    6,
+  dpi =
+    300
+)
+# Bias
+#
+# Bias is also conditional on an estimate being available.
+# Positive values indicate over-selection.
+# Negative values indicate under-selection.
+bias_plot_data <- identification_results %>%
+  dplyr::filter(
+    estimate_available
+  ) %>%
+  dplyr::group_by(
+    s_true,
+    method,
+    estimator
+  ) %>%
+  dplyr::summarise(
+    Bias =
+      mean(
+        signed_error,
+        na.rm = TRUE
+      ),
+    .groups =
+      "drop"
+  )
+p_bias <- ggplot2::ggplot(
+  bias_plot_data,
+  ggplot2::aes(
+    x =
+      s_true,
+    y =
+      Bias,
+    group =
+      estimator,
+    linetype =
+      estimator,
+    shape =
+      estimator
+  )
+) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linetype = "dotted"
+  ) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(
+    size = 2.5
+  ) +
+  ggplot2::facet_wrap(
+    ~ method
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks =
+      true_sizes
+  ) +
+  ggplot2::labs(
+    x =
+      "True model size",
+    y =
+      "Bias in estimated model size",
+    linetype =
+      "Estimator",
+    shape =
+      "Estimator"
+  ) +
+  ggplot2::theme_minimal()
+print(
+  p_bias
+)
+ggplot2::ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "model_size_bias.png"
+    ),
+  plot =
+    p_bias,
+  width =
+    10,
+  height =
+    6,
+  dpi =
+    300
+)
+```
+
+```{r}
+# Section 22
+# Example threshold and breakpoint diagnostic plots
+#
+# Replication 1, true model size 4
+# Threshold diagnostic
+example_threshold_data <- diagnostic_curves %>%
+  dplyr::filter(
+    rep ==
+      1,
+    s_true ==
+      4
+  ) %>%
+  dplyr::mutate(
+    ratio_for_plot =
+      pmax(
+        ratio,
+        ratio_floor
+      )
+  )
+example_threshold_estimates <- example_threshold_data %>%
+  dplyr::group_by(
+    method
+  ) %>%
+  dplyr::summarise(
+    threshold_hat =
+      dplyr::first(
+        threshold_hat
+      ),
+    .groups =
+      "drop"
+  ) %>%
+  # Do not attempt to draw a vertical line if the theoretical
+  # threshold estimator did not produce an estimate.
+  dplyr::filter(
+    !is.na(
+      threshold_hat
+    )
+  )
+p_example_threshold <- ggplot2::ggplot(
+  example_threshold_data,
+  ggplot2::aes(
+    x =
+      k,
+    y =
+      ratio_for_plot
+  )
+) +
+  ggplot2::geom_hline(
+    yintercept = 1,
+    linetype = "dashed"
+  ) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(
+    size = 2.5
+  ) +
+  ggplot2::geom_vline(
+    data =
+      example_threshold_estimates,
+    ggplot2::aes(
+      xintercept =
+        threshold_hat
+    ),
+    linetype =
+      "dotted"
+  ) +
+  ggplot2::facet_wrap(
+    ~ method
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks =
+      k_values
+  ) +
+  ggplot2::scale_y_log10() +
+  ggplot2::labs(
+    x =
+      "Candidate model size",
+    y =
+      "Score / level"
+  ) +
+  ggplot2::theme_minimal()
+print(
+  p_example_threshold
+)
+ggplot2::ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "example_threshold_diagnostic.png"
+    ),
+  plot =
+    p_example_threshold,
+  width =
+    10,
+  height =
+    6,
+  dpi =
+    300
+)
+# Piecewise breakpoint diagnostic
+example_piecewise_data <- diagnostic_curves %>%
+  dplyr::filter(
+    rep ==
+      1,
+    s_true ==
+      4,
+    used_in_piecewise
+  )
+example_breakpoints <- example_piecewise_data %>%
+  dplyr::group_by(
+    method
+  ) %>%
+  dplyr::summarise(
+    breakpoint_after_k =
+      dplyr::first(
+        breakpoint_after_k
+      ),
+    piecewise_hat =
+      dplyr::first(
+        piecewise_hat
+      ),
+    .groups =
+      "drop"
+  ) %>%
+  # Do not attempt to draw a breakpoint line for a method
+  # whose breakpoint fit was unavailable.
+  dplyr::filter(
+    !is.na(
+      breakpoint_after_k
+    )
+  )
+p_example_piecewise <- ggplot2::ggplot(
+  example_piecewise_data,
+  ggplot2::aes(
+    x =
+      k,
+    y =
+      log10_ratio
+  )
+) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linetype = "dotted"
+  ) +
+  ggplot2::geom_point(
+    size = 2.5
+  ) +
+  ggplot2::geom_line(
+    ggplot2::aes(
+      y =
+        piecewise_fit,
+      group =
+        interaction(
+          method,
+          piecewise_segment
+        )
+    )
+  ) +
+  ggplot2::geom_vline(
+    data =
+      example_breakpoints,
+    ggplot2::aes(
+      xintercept =
+        breakpoint_after_k +
+        0.5
+    ),
+    linetype =
+      "dashed"
+  ) +
+  ggplot2::facet_wrap(
+    ~ method
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks =
+      1:(
+        k_max -
+          1
+      )
+  ) +
+  ggplot2::labs(
+    x =
+      "Candidate model size",
+    y =
+      expression(
+        log[10] *
+          R(k)
+      )
+  ) +
+  ggplot2::theme_minimal()
+print(
+  p_example_piecewise
+)
+ggplot2::ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "example_piecewise_diagnostic.png"
+    ),
+  plot =
+    p_example_piecewise,
+  width =
+    10,
+  height =
+    6,
+  dpi =
+    300
+)
+```
+
+```{r}
+# Section 23
+# Distribution of estimated model sizes
+estimated_size_distribution <- identification_results %>%
+  dplyr::filter(
+    estimate_available
+  ) %>%
+  dplyr::group_by(
+    s_true,
+    method,
+    estimator,
+    s_hat
+  ) %>%
+  dplyr::summarise(
+    count =
+      dplyr::n(),
+    .groups =
+      "drop"
+  ) %>%
+  dplyr::group_by(
+    s_true,
+    method,
+    estimator
+  ) %>%
+  dplyr::mutate(
+    proportion =
+      count /
+      sum(
+        count
+      )
+  ) %>%
+  dplyr::ungroup()
+print(
+  estimated_size_distribution
+)
+write.csv(
+  estimated_size_distribution,
+  file.path(
+    output_dir,
+    "estimated_size_distribution.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+# L0Learn successful model-size identification runs
+l0learn_worked <- identification_results %>%
+  dplyr::filter(
+    method == "L0Learn"
+  ) %>%
+  dplyr::group_by(
+    s_true,
+    estimator
+  ) %>%
+  dplyr::summarise(
+    total_simulations =
+      dplyr::n(),
+    worked =
+      sum(
+        estimate_available,
+        na.rm = TRUE
+      ),
+    failed =
+      sum(
+        !estimate_available,
+        na.rm = TRUE
+      ),
+    proportion_worked =
+      mean(
+        estimate_available,
+        na.rm = TRUE
+      ),
+    .groups = "drop"
+  )
+print(
+  l0learn_worked
+)
+```
